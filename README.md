@@ -318,6 +318,25 @@ Make an authenticated `GET` request to `/__abs-cache/status` (passing your Audio
 }
 ```
 
+### Benchmarking Your Deployment
+You can benchmark **Origin vs. Edge (R2 HIT)** audio play-start TTFB, scrubbing/seeking latency (`64 KB` random byte-range jumps), and `10 MB` streaming throughput using [scripts/benchmark.mjs](./scripts/benchmark.mjs) (all server URLs and tokens are passed via environment variables):
+
+```bash
+# macOS / Linux
+ABS_EDGE_URL="https://audiobooks.example.com" \
+ABS_ORIGIN_URL="https://abs-origin.example.com" \
+ABS_TOKEN="your-audiobookshelf-jwt-or-api-key" \
+npm run benchmark
+
+# Windows PowerShell
+$env:ABS_EDGE_URL="https://audiobooks.example.com"
+$env:ABS_ORIGIN_URL="https://abs-origin.example.com"
+$env:ABS_TOKEN="your-audiobookshelf-jwt-or-api-key"
+npm run benchmark
+```
+
+Optional: set `ABS_ITEM_ID` to target a specific audiobook ID. The script opens a temporary playback session, waits for R2 to warm Track 1, runs the Origin vs. Edge comparisons, and automatically closes the session when done.
+
 ---
 
 ## 10. Client Compatibility
