@@ -110,6 +110,8 @@ If `GET /api/me/progress`, `GET /api/libraries/:id/personalized`, or `GET /api/i
   * **Covers & Author Images (`/api/items/:id/cover`, `/api/authors/:id/image`):** Cached for **30 days** (`COVER_TTL_S`), keyed by query parameters (`width`, `format`, `raw`, `ts`).
   * **Static Library & Metadata Lists (`/api/libraries`, `/api/libraries/:id/items`, `/series`, `/authors`, `/collections`, `/filterdata`, `/stats`):** Cached per user with a **2-minute fresh window** (`JSON_FRESH_S = 120`) and a **1-hour Stale-While-Revalidate window** (`JSON_SWR_S = 3600`).
   * **Edge `304 Not Modified` (`ETag` / `If-None-Match`):** Whenever a client sends a matching `If-None-Match` header for cached covers, assets, HTML, JSON, or R2 audio, the Worker short-circuits with `304 Not Modified` (0 bytes).
+  * **RSS Feeds (`/feed/:slug` & `/feed/:slug/:file`):** Hosted Audiobookshelf RSS feed XML is edge-cached (`RSS_FRESH_S = 300`, `RSS_SWR_S = 3600`), and RSS `<enclosure>` audio files are cached in R2 with `206` byte-range support.
+  * **Offline-Origin Resilience (`STALE-IF-ERROR` + Queued Progress Writes):** If your home server is temporarily offline or rebooting (`502`/`503`/`504`/`520`–`530` or unreachable), cached covers, metadata, RSS feeds, and the Web UI fall back to `STALE-IF-ERROR` while R2 audio keeps playing. Listening progress writes (`/api/session/:id/sync`, `/api/session/:id/close`, `PATCH /api/me/progress`)—and *only* progress writes—are held in the Cloudflare Queue (`x-abs-cache: QUEUED-OFFLINE`) and automatically replayed to your home server as soon as it comes back online.
   * **Smart `currentTime` Sliding-Window Queue Warming (`WARM_WINDOW_TRACKS`):** When you press Play mid-book, the Queue sorts tracks so the **currently playing chapter and subsequent chapters warm into R2 first**, bounded by `WARM_WINDOW_TRACKS` (default `5` tracks; set to `0` to warm the entire book immediately). As you listen through a multi-file audiobook, the sliding window automatically warms upcoming chapters ahead of you—preventing wasted R2 writes and storage if you abandon a long multi-file book early.
 
 ### How Instant Edit Invalidation Works (Epoch Counter)
@@ -211,6 +213,8 @@ All settings are configured via environment variables (`vars` in `wrangler.jsonc
 | `PJSON_SWR_S` | `"600"` | Edge cache Stale-While-Revalidate window in seconds for progress-aware endpoints (default: 10 minutes). |
 | `HTML_FRESH_S` | `"300"` | Edge cache fresh window in seconds for the Web UI SPA HTML shell and `/sw.js` (default: 5 minutes). |
 | `HTML_SWR_S` | `"86400"` | Edge cache Stale-While-Revalidate window in seconds for the Web UI SPA HTML shell (default: 24 hours). |
+| `RSS_FRESH_S` | `"300"` | Edge cache fresh window in seconds for `/feed/:slug` RSS XML feeds (default: 5 minutes). |
+| `RSS_SWR_S` | `"3600"` | Edge cache Stale-While-Revalidate window in seconds for `/feed/:slug` RSS XML feeds (default: 1 hour). |
 
 ---
 

@@ -19,6 +19,7 @@ const BLOCK_EXT = /\.(php\d?|aspx?|jsp|cgi|sql|bak|ini|ya?ml|conf|env|git|log|sw
 const APP_PATH = /^\/(api|public|s|hls|socket\.io|login|logout|status|ping|auth|feed|_nuxt)(\/|$)/;
 const NOBUMP = /^\/api\/(session|me|authorize|items\/[^/]+\/play)(\/|$)/;
 const PROGRESS_WRITE_RE = /^\/api\/(session(\/|$)|me\/progress(\/|$)|items\/[^/]+\/play(\/|$))/;
+const OFFLINE_PROGRESS_QUEUE_RE = /^\/api\/(session\/[^/]+\/(sync|close)|me\/progress(\/[^/]+)?)$/;
 const STATIC_ASSET_RE = /^\/_nuxt\/.+|\.(css|js|mjs|woff2?|ttf|otf|eot|svg|ico|webp|png|jpg|jpeg|gif|webmanifest|map)$/i;
 const NON_HTML_PREFIX = /^\/(api|public|s|hls|socket\.io|auth|feed|logout|status|ping)(\/|$)/;
 
@@ -34,6 +35,10 @@ var cachedHmacKey = null;
 var cachedHmacSecret = "";
 
 function num(v, d) { var n = parseInt(v, 10); return isNaN(n) ? d : n; }
+
+function isOriginDownStatus(status) {
+  return status === 502 || status === 503 || status === 504 || (status >= 520 && status <= 530);
+}
 
 function isTruthyFlag(v, defaultVal) {
   if (v === undefined || v === null || String(v).trim() === "") return defaultVal;
@@ -419,6 +424,7 @@ function normQuery(url) {
 }
 
 function classify(cp, search, request) {
+  if (/^\/feed\/[^/]+$/.test(cp)) return "rss";
   if (/^\/api\/items\/[^/]+\/cover$/.test(cp) || /^\/api\/authors\/[^/]+\/image$/.test(cp)) return "cover";
   if (cp.indexOf("/api/") !== 0 && !NON_HTML_PREFIX.test(cp)) {
     if (cp === "/sw.js") return "html";
@@ -516,10 +522,10 @@ async function refresh(request, env, url, key, ttl, kind) {
 }
 
 async function edgeLookup(request, env, ctx, url, cp, kind) {
-  var out = { res: null, fill: null };
+  var out = { res: null, fill: null, fallback: null };
   try {
     var jwtMode = isJwtVerifyEnabled(env);
-    var isPublicKind = (kind === "asset" || kind === "html" || (kind === "cover" && !jwtMode));
+    var isPublicKind = (kind === "asset" || kind === "html" || kind === "rss" || (kind === "cover" && !jwtMode));
     var cred = credential(request, url);
     if (!cred && !isPublicKind) return out;
     var ch = cred ? await sha16(cred) : "";
@@ -527,18 +533,21 @@ async function edgeLookup(request, env, ctx, url, cp, kind) {
     var user = cred ? (userOf(cred) || ch) : "anon";
     var prefix = kind === "cover" ? "c|"
       : (kind === "asset" ? "a|"
+      : (kind === "rss" ? "r|"
       : (kind === "html" ? "h|" + url.pathname + "|"
-      : (kind === "pjson" ? "pj|" + user + "|" : "j|" + user + "|")));
+      : (kind === "pjson" ? "pj|" + user + "|" : "j|" + user + "|"))));
     var keyStr = (kind === "html" ? prefix + normQuery(url) : prefix + cp + "|" + normQuery(url));
     var key = base + "d/" + (await sha16(keyStr));
     var fresh = (kind === "cover" || kind === "asset")
       ? num(env.COVER_TTL_S, 2592000)
       : (kind === "html" ? num(env.HTML_FRESH_S, 300)
-      : (kind === "pjson" ? num(env.PJSON_FRESH_S, 60) : num(env.JSON_FRESH_S, 120)));
+      : (kind === "rss" ? num(env.RSS_FRESH_S, 300)
+      : (kind === "pjson" ? num(env.PJSON_FRESH_S, 60) : num(env.JSON_FRESH_S, 120))));
     var swr = (kind === "cover" || kind === "asset")
       ? 0
       : (kind === "html" ? num(env.HTML_SWR_S, 86400)
-      : (kind === "pjson" ? num(env.PJSON_SWR_S, 600) : num(env.JSON_SWR_S, 3600)));
+      : (kind === "rss" ? num(env.RSS_SWR_S, 3600)
+      : (kind === "pjson" ? num(env.PJSON_SWR_S, 600) : num(env.JSON_SWR_S, 3600))));
     out.fill = { key: key, ttl: fresh + swr + 60, kind: kind };
     var parts = await Promise.all([
       isPublicKind ? Promise.resolve(true) : isCredentialValid(env, request, url),
@@ -548,6 +557,7 @@ async function edgeLookup(request, env, ctx, url, cp, kind) {
     ]);
     var valid = parts[0], hit = parts[1], epoch = Math.max(parts[2], parts[3]);
     if (valid && hit) {
+      out.fallback = hit;
       var at = parseInt(hit.headers.get("x-cached-at") || "0", 10);
       if (at > epoch) {
         var age = (Date.now() - at) / 1000;
@@ -983,6 +993,46 @@ async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, i
   } catch (e) { return null; }
 }
 
+async function serveRssAudioFromCache(request, env, ctx, cp, slug, restPath) {
+  try {
+    var r2State = await getR2State(env, false);
+    if (r2State.tripped) return { hit: null, bypassed: true };
+    var key = "rss/" + slug + "/" + (await sha16(restPath));
+    var resp = await buildR2TrackResponse(request, env, ctx, { key: key, mime: "" }, false);
+    if (!resp) {
+      ctx.waitUntil(enqueueTrackJob(env, { type: "rss-track", item: "rss-" + slug, path: cp, key: key }));
+      return { hit: null, bypassed: false };
+    }
+    return { hit: resp, bypassed: false };
+  } catch (e) { return { hit: null, bypassed: false }; }
+}
+
+async function queueOfflineProgressWrite(env, request, url, cp, bodyText) {
+  try {
+    if (!env.WARM) return false;
+    var cred = credential(request, url);
+    if (!cred) return false;
+    if (isJwtVerifyEnabled(env)) {
+      var v = await verifyJwtToken(env, cred);
+      if (!v.valid) return false;
+    }
+    var fwdHeaders = {};
+    if (request.headers.get("authorization")) fwdHeaders["authorization"] = request.headers.get("authorization");
+    if (request.headers.get("cookie")) fwdHeaders["cookie"] = request.headers.get("cookie");
+    if (request.headers.get("content-type")) fwdHeaders["content-type"] = request.headers.get("content-type");
+    await env.WARM.send({
+      type: "progress",
+      method: request.method,
+      pathWithSearch: url.pathname + url.search,
+      headers: fwdHeaders,
+      body: bodyText,
+      queuedAt: Date.now()
+    });
+    await bumpProgressEpoch(env, request, url, url.origin + "/__edge/");
+    return true;
+  } catch (e) { return false; }
+}
+
 export default {
   async fetch(request, env, ctx) {
     var url = new URL(request.url);
@@ -1057,6 +1107,14 @@ export default {
       if (dlHit) { ctx.waitUntil(record(env, request, dlHit, url, cp)); return dlHit; }
     }
 
+    // 3. RSS Feed Audio Enclosures (/feed/:slug/:file...): serves from R2 and warms on miss
+    var rssAudio = cp.match(/^\/feed\/([^/]+)\/(.+)$/);
+    if (rssAudio && env.CACHE && (request.method === "GET" || request.method === "HEAD")) {
+      var rssRes = await serveRssAudioFromCache(request, env, ctx, cp, rssAudio[1], rssAudio[2]);
+      if (rssRes.hit) { ctx.waitUntil(record(env, request, rssRes.hit, url, cp)); return rssRes.hit; }
+      if (rssRes.bypassed) r2Bypassed = true;
+    }
+
     var lookup = null;
     if (request.method === "GET" && env.EDGE_CACHE !== "off" && !request.headers.has("range")) {
       var kind = classify(cp, url.search, request);
@@ -1083,8 +1141,44 @@ export default {
 
     var isLogout = (request.method === "POST" && (/^\/logout(\/|$)/.test(cp) || /^\/api\/logout(\/|$)/.test(cp)));
 
+    var isProgressWrite = (request.method === "POST" || request.method === "PATCH") && OFFLINE_PROGRESS_QUEUE_RE.test(cp);
+    var reqCloneForOffline = isProgressWrite ? request.clone() : null;
+
     var target = new URL(p + url.search, origin);
-    var resp = await fetch(new Request(target.toString(), request), { redirect: "manual" });
+    var resp = null;
+    var fetchErr = null;
+    try {
+      resp = await fetch(new Request(target.toString(), request), { redirect: "manual" });
+    } catch (e) {
+      fetchErr = e;
+    }
+
+    if (fetchErr || (resp && isOriginDownStatus(resp.status))) {
+      if (lookup && lookup.fallback) {
+        var sie = tag(request, lookup.fallback, "STALE-IF-ERROR");
+        ctx.waitUntil(record(env, request, sie, url, cp));
+        return sie;
+      }
+      if (isProgressWrite && reqCloneForOffline && env.WARM) {
+        var bodyText = "";
+        try { bodyText = await reqCloneForOffline.text(); } catch (e) {}
+        var queued = await queueOfflineProgressWrite(env, request, url, cp, bodyText);
+        if (queued) {
+          if (closeMatch) ctx.waitUntil(closeSessionInKv(env, closeMatch[1]));
+          var qHeaders = new Headers({ "content-type": "application/json", "x-abs-cache": "QUEUED-OFFLINE" });
+          qHeaders.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
+          applySecurityHeaders(qHeaders);
+          var qResp = new Response(JSON.stringify({ offlineQueued: true }), { status: 200, headers: qHeaders });
+          ctx.waitUntil(record(env, request, qResp, url, cp));
+          return qResp;
+        }
+      }
+      if (fetchErr) {
+        var errH = new Headers({ "content-type": "application/json", "x-abs-cache": "ORIGIN-OFFLINE" });
+        applySecurityHeaders(errH);
+        return new Response(JSON.stringify({ error: "Origin unreachable" }), { status: 502, headers: errH });
+      }
+    }
 
     if (isLoginPost && loginCheck) {
       ctx.waitUntil(recordLoginResult(env, url, loginCheck.ip, resp.ok));
@@ -1158,15 +1252,12 @@ export default {
 
   async queue(batch, env) {
     var r2State = await getR2State(env, true);
-    if (!env.CACHE || r2State.tripped) {
-      for (var m0 of batch.messages) m0.ack();
-      return;
-    }
+    var r2Skip = (!env.CACHE || r2State.tripped);
     var lim = getLimits(env);
     var snapshot = [];
     var existingKeys = {};
     var currentTotal = 0;
-    if (lim.guardEnabled) {
+    if (lim.guardEnabled && !r2Skip) {
       snapshot = await listAllObjects(env);
       for (var o of snapshot) {
         existingKeys[o.key] = true;
@@ -1177,13 +1268,29 @@ export default {
     for (var msg of batch.messages) {
       var j = msg.body;
       try {
+        if (j && j.type === "progress") {
+          var pOrigin = new URL(env.ORIGIN);
+          var pResp = await fetch(new URL(j.pathWithSearch, pOrigin).toString(), {
+            method: j.method || "POST",
+            headers: j.headers || {},
+            body: j.body || undefined
+          });
+          if (pResp.ok || (pResp.status >= 400 && pResp.status < 500)) {
+            msg.ack();
+          } else {
+            msg.retry();
+          }
+          continue;
+        }
+        if (r2Skip) { msg.ack(); continue; }
         var stateNow = await getR2State(env, false);
         if (stateNow.tripped) { msg.ack(); continue; }
         if (!j || !j.key || existingKeys[j.key]) { msg.ack(); continue; }
         if (!lim.guardEnabled && (await env.CACHE.head(j.key))) { msg.ack(); continue; }
         var activeItem = j.item || j.key.split("/")[0] || "";
         var origin = new URL(env.ORIGIN);
-        var r = await fetch(new URL("/public/session/" + j.sid + "/track/" + j.n, origin).toString());
+        var originPath = (j.type === "rss-track" && j.path) ? j.path : ("/public/session/" + j.sid + "/track/" + j.n);
+        var r = await fetch(new URL(originPath, origin).toString());
         if (r.status === 404 || r.status === 401 || r.status === 403) {
           if (env.KV) await env.KV.delete("warm:" + j.key);
           msg.ack();
@@ -1222,6 +1329,6 @@ export default {
         msg.ack();
       } catch (e) { msg.retry(); }
     }
-    if (lim.guardEnabled) await recordR2Ops(env, 0, 0, currentTotal, true);
+    if (lim.guardEnabled && !r2Skip) await recordR2Ops(env, 0, 0, currentTotal, true);
   }
 };
