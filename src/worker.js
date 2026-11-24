@@ -4,6 +4,9 @@
 // - learns playback sessions, serves cached audio from R2, warms cache via Queue ONLY on active playback
 // - accelerates offline book downloads (/api/items/:id/file/:ino, /s/item/:id/:file) from R2 if ALREADY cached,
 //   without warming/storing downloaded books into R2 on a miss
+// - optional Cryptographic JWT Verification (VERIFY_JWT = "no" by default; set VERIFY_JWT = "yes" and provide
+//   JWT_SECRET from Audiobookshelf's tokenSecret to cryptographically verify HS256 JWTs, enforce exp/nbf,
+//   track token revocation/logout, and bind R2 playback sessions to verified tokens)
 // - optional Free-Tier R2 Circuit Breaker (FREE_TIER_GUARD = "yes" by default; set to "no" for unlimited paid R2)
 
 const ID_RE = /^(li|ses|usr|lib|ser|aut|col|pl|ep|fol|dev)_[a-z0-9]+$/i;
@@ -25,12 +28,23 @@ var pendingClassA = 0;
 var pendingClassB = 0;
 var cachedBreakerState = null;
 var cachedBreakerAt = 0;
+var cachedHmacKey = null;
+var cachedHmacSecret = "";
 
 function num(v, d) { var n = parseInt(v, 10); return isNaN(n) ? d : n; }
 
+function isTruthyFlag(v, defaultVal) {
+  if (v === undefined || v === null || String(v).trim() === "") return defaultVal;
+  var s = String(v).trim().toLowerCase();
+  return (s === "yes" || s === "true" || s === "on" || s === "1");
+}
+
 function isFreeTierGuardEnabled(env) {
-  var v = String(env.FREE_TIER_GUARD === undefined ? "yes" : env.FREE_TIER_GUARD).trim().toLowerCase();
-  return !(v === "no" || v === "false" || v === "off" || v === "0");
+  return isTruthyFlag(env.FREE_TIER_GUARD, true);
+}
+
+function isJwtVerifyEnabled(env) {
+  return isTruthyFlag(env.VERIFY_JWT, false) && Boolean(env.JWT_SECRET && String(env.JWT_SECRET).trim());
 }
 
 function monthKey() {
@@ -51,7 +65,7 @@ function getLimits(env) {
 }
 
 async function getR2State(env, forceRefresh) {
-  if (env.R2_DISABLED === "true" || env.R2_DISABLED === "1" || env.R2_DISABLED === "yes") {
+  if (isTruthyFlag(env.R2_DISABLED, false)) {
     return { a: 0, b: 0, bytes: 0, tripped: true, reason: "R2_DISABLED env flag set" };
   }
   var lim = getLimits(env);
@@ -173,29 +187,150 @@ async function record(env, request, resp, url, cp) {
   } catch (e) {}
 }
 
-// ---------- edge cache for Web UI assets (HTML/CSS/JS), covers & static metadata ----------
+// ---------- Auth, Optional HS256 Cryptographic JWT Verification & Revocation ----------
 
 async function sha16(s) {
   var d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return Array.from(new Uint8Array(d)).slice(0, 8).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
 }
 
+function b64UrlToBytes(b64url) {
+  var b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4 !== 0) b64 += "=";
+  var bin = atob(b64);
+  var out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 function credential(request, url) {
   var a = request.headers.get("authorization");
   if (a && /^Bearer /i.test(a)) return a.slice(7).trim();
-  return url.searchParams.get("token") || "";
+  var q = url.searchParams.get("token");
+  if (q) return q.trim();
+  var cookie = request.headers.get("cookie") || "";
+  var cm = /(?:^|;\s*)(?:token|abs_token|auth\.token)=([^;]+)/i.exec(cookie);
+  if (cm) {
+    try { return decodeURIComponent(cm[1]).replace(/^Bearer\s+/i, "").trim(); } catch (e) {}
+  }
+  return "";
+}
+
+function parseJwtPayload(cred) {
+  try {
+    var p = cred.split(".");
+    if (p.length !== 3) return null;
+    var bytes = b64UrlToBytes(p[1]);
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (e) { return null; }
 }
 
 function userOf(cred) {
+  var j = parseJwtPayload(cred);
+  if (!j) return "";
+  return String(j.userId || j.id || j.sub || j.keyId || "");
+}
+
+async function getHmacKey(secret) {
+  if (cachedHmacKey && cachedHmacSecret === secret) return cachedHmacKey;
+  var keyBytes = new TextEncoder().encode(secret);
+  cachedHmacKey = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  cachedHmacSecret = secret;
+  return cachedHmacKey;
+}
+
+// Cryptographically verifies an Audiobookshelf JWT (HS256) against env.JWT_SECRET,
+// checks exp and nbf timestamps, and checks KV revocation tombstones.
+async function verifyJwtToken(env, cred) {
   try {
-    var p = cred.split(".");
-    if (p.length === 3) {
-      var j = JSON.parse(atob(p[1].replace(/-/g, "+").replace(/_/g, "/")));
-      return String(j.userId || j.id || j.sub || "");
+    if (!cred) return { valid: false, reason: "missing_token" };
+    var parts = cred.split(".");
+    if (parts.length !== 3) return { valid: false, reason: "malformed_jwt" };
+    var header = JSON.parse(new TextDecoder().decode(b64UrlToBytes(parts[0])));
+    if (!header || header.alg !== "HS256") return { valid: false, reason: "unsupported_alg" };
+
+    var key = await getHmacKey(String(env.JWT_SECRET).trim());
+    var data = new TextEncoder().encode(parts[0] + "." + parts[1]);
+    var sig = b64UrlToBytes(parts[2]);
+    var ok = await crypto.subtle.verify("HMAC", key, sig, data);
+    if (!ok) return { valid: false, reason: "invalid_signature" };
+
+    var payload = JSON.parse(new TextDecoder().decode(b64UrlToBytes(parts[1])));
+    var nowSec = Math.floor(Date.now() / 1000);
+    if (payload.exp && typeof payload.exp === "number" && nowSec >= payload.exp) {
+      return { valid: false, reason: "token_expired" };
+    }
+    if (payload.nbf && typeof payload.nbf === "number" && nowSec < payload.nbf - 30) {
+      return { valid: false, reason: "token_not_yet_valid" };
+    }
+
+    var ch = await sha16(cred);
+    if (env.KV) {
+      var rev = await env.KV.get("revoked:" + ch, { cacheTtl: 60 });
+      if (rev) return { valid: false, reason: "token_revoked" };
+    }
+
+    var uid = String(payload.userId || payload.id || payload.sub || payload.keyId || "");
+    return { valid: true, userId: uid, tokenHash: ch, payload: payload };
+  } catch (e) {
+    return { valid: false, reason: "verify_exception" };
+  }
+}
+
+async function revokeToken(env, request, url) {
+  try {
+    var cred = credential(request, url);
+    if (!cred) return;
+    var ch = await sha16(cred);
+    await caches.default.delete(url.origin + "/__edge/v/" + ch);
+    if (env.KV) {
+      await env.KV.put("revoked:" + ch, String(Date.now()), { expirationTtl: 2592000 });
     }
   } catch (e) {}
-  return "";
 }
+
+async function markValid(env, request, url) {
+  try {
+    var cred = credential(request, url);
+    if (!cred) return;
+    if (isJwtVerifyEnabled(env)) {
+      var v = await verifyJwtToken(env, cred);
+      if (!v.valid) return;
+    }
+    var ch = await sha16(cred);
+    if (env.KV) {
+      var rev = await env.KV.get("revoked:" + ch, { cacheTtl: 60 });
+      if (rev) return;
+    }
+    var k = url.origin + "/__edge/v/" + ch;
+    if (await caches.default.match(k)) return;
+    await caches.default.put(k, new Response("1", { headers: { "cache-control": "max-age=900" } }));
+  } catch (e) {}
+}
+
+async function isCredentialValid(env, request, url) {
+  var cred = credential(request, url);
+  if (!cred) return false;
+  var ch = await sha16(cred);
+  if (env.KV) {
+    var rev = await env.KV.get("revoked:" + ch, { cacheTtl: 60 });
+    if (rev) return false;
+  }
+  if (isJwtVerifyEnabled(env)) {
+    var v = await verifyJwtToken(env, cred);
+    return v.valid;
+  }
+  var k = url.origin + "/__edge/v/" + ch;
+  return Boolean(await caches.default.match(k));
+}
+
+// ---------- edge cache for Web UI assets (HTML/CSS/JS), covers & static metadata ----------
 
 function normQuery(url) {
   var ps = [];
@@ -207,7 +342,7 @@ function normQuery(url) {
 function classify(cp, search, request) {
   if (/^\/api\/items\/[^/]+\/cover$/.test(cp) || /^\/api\/authors\/[^/]+\/image$/.test(cp)) return "cover";
   if (cp.indexOf("/api/") !== 0 && !NON_HTML_PREFIX.test(cp)) {
-    if (cp === "/sw.js") return "html"; // Service worker gets short HTML-like fresh+SWR window
+    if (cp === "/sw.js") return "html";
     if (STATIC_ASSET_RE.test(cp)) return "asset";
     var accept = request.headers.get("accept") || "";
     if (accept.indexOf("text/html") !== -1) return "html";
@@ -260,23 +395,6 @@ function tag(hit, label) {
   return r;
 }
 
-async function markValid(request, url) {
-  try {
-    var cred = credential(request, url);
-    if (!cred) return;
-    var k = url.origin + "/__edge/v/" + (await sha16(cred));
-    if (await caches.default.match(k)) return;
-    await caches.default.put(k, new Response("1", { headers: { "cache-control": "max-age=900" } }));
-  } catch (e) {}
-}
-
-async function isCredentialValid(request, url) {
-  var cred = credential(request, url);
-  if (!cred) return false;
-  var k = url.origin + "/__edge/v/" + (await sha16(cred));
-  return Boolean(await caches.default.match(k));
-}
-
 async function refresh(request, env, url, key, ttl, kind) {
   try {
     var origin = new URL(env.ORIGIN);
@@ -289,14 +407,14 @@ async function refresh(request, env, url, key, ttl, kind) {
 async function edgeLookup(request, env, ctx, url, cp, kind) {
   var out = { res: null, fill: null };
   try {
-    var isPublicKind = (kind === "cover" || kind === "asset" || kind === "html");
+    var jwtMode = isJwtVerifyEnabled(env);
+    var isPublicKind = (kind === "asset" || kind === "html" || (kind === "cover" && !jwtMode));
     var cred = credential(request, url);
     if (!cred && !isPublicKind) return out;
     var ch = cred ? await sha16(cred) : "";
     var cache = caches.default, base = url.origin + "/__edge/";
     var user = cred ? (userOf(cred) || ch) : "anon";
     var prefix = kind === "cover" ? "c|" : (kind === "asset" ? "a|" : (kind === "html" ? "h|" + url.pathname + "|" : "j|" + user + "|"));
-    // Note: for HTML shell, key by actual url.pathname (since base path / vs /audiobookshelf/ affects asset links in HTML)
     var keyStr = (kind === "html" ? prefix + normQuery(url) : prefix + cp + "|" + normQuery(url));
     var key = base + "d/" + (await sha16(keyStr));
     var fresh = (kind === "cover" || kind === "asset")
@@ -307,7 +425,7 @@ async function edgeLookup(request, env, ctx, url, cp, kind) {
       : (kind === "html" ? num(env.HTML_SWR_S, 86400) : num(env.JSON_SWR_S, 3600));
     out.fill = { key: key, ttl: fresh + swr + 60, kind: kind };
     var parts = await Promise.all([
-      (cred && !isPublicKind) ? cache.match(base + "v/" + ch) : Promise.resolve(true),
+      isPublicKind ? Promise.resolve(true) : isCredentialValid(env, request, url),
       cache.match(key),
       kind === "asset" ? Promise.resolve(0) : getEpoch(env, cache, base)
     ]);
@@ -482,10 +600,19 @@ async function learnItemDetails(env, resp) {
   } catch (e) {}
 }
 
-async function learnSessionData(env, s) {
+async function learnSessionData(env, s, request, url) {
   try {
     var sid = s && s.id, item = s && s.libraryItemId;
     if (!sid || !item || !Array.isArray(s.audioTracks)) return;
+    var cred = request && url ? credential(request, url) : "";
+    var tokenHash = cred ? await sha16(cred) : "";
+    var userId = String((s && s.userId) || (cred ? userOf(cred) : "") || "");
+    if (isJwtVerifyEnabled(env) && cred) {
+      var v = await verifyJwtToken(env, cred);
+      if (!v.valid) return;
+      userId = v.userId || userId;
+      tokenHash = v.tokenHash || tokenHash;
+    }
     var tracks = {}, jobs = [];
     for (var i = 0; i < s.audioTracks.length; i++) {
       var t = s.audioTracks[i];
@@ -497,7 +624,13 @@ async function learnSessionData(env, s) {
       tracks[n] = { key: key, size: size, mime: mime };
       jobs.push({ sid: sid, item: item, n: n, key: key, size: size, mime: mime });
     }
-    await env.KV.put("sess:" + sid, JSON.stringify({ item: item, tracks: tracks }), { expirationTtl: 172800 });
+    await env.KV.put("sess:" + sid, JSON.stringify({
+      item: item,
+      userId: userId,
+      tokenHash: tokenHash,
+      closed: false,
+      tracks: tracks
+    }), { expirationTtl: 172800 });
     await saveItemFileMap(env, item, s.audioTracks, s.libraryItem && s.libraryItem.libraryFiles);
     if (env.CACHE && env.WARM) {
       var r2State = await getR2State(env, false);
@@ -514,16 +647,28 @@ async function learnSessionData(env, s) {
   } catch (e) {}
 }
 
-async function learnSession(env, resp) {
+async function learnSession(env, resp, request, url) {
   try {
     var s = await resp.json();
-    await learnSessionData(env, s);
+    await learnSessionData(env, s, request, url);
   } catch (e) {}
 }
 
-async function ensureSessionLearned(env, request, sid) {
+async function closeSessionInKv(env, sid) {
   try {
     if (!env.KV || !sid) return;
+    await env.KV.delete("sess:" + sid);
+  } catch (e) {}
+}
+
+async function ensureSessionLearned(env, request, url, sid) {
+  try {
+    if (!env.KV || !sid) return;
+    if (isJwtVerifyEnabled(env)) {
+      var cred = credential(request, url);
+      var v = await verifyJwtToken(env, cred);
+      if (!v.valid) return;
+    }
     var raw = await env.KV.get("sess:" + sid);
     if (raw) {
       var parsed = JSON.parse(raw);
@@ -538,7 +683,7 @@ async function ensureSessionLearned(env, request, sid) {
       headers: h
     });
     if (r.ok) {
-      await learnSessionData(env, await r.json());
+      await learnSessionData(env, await r.json(), request, url);
     }
   } catch (e) {}
 }
@@ -587,13 +732,32 @@ async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
   return new Response(obj.body, { status: status, headers: headers });
 }
 
-async function serveFromCache(request, env, ctx, sid, n) {
+async function serveFromCache(request, env, ctx, url, sid, n) {
   try {
     var r2State = await getR2State(env, false);
     if (r2State.tripped) return { hit: null, bypassed: true };
     var raw = await env.KV.get("sess:" + sid);
     if (!raw) return { hit: null, bypassed: false };
     var sess = JSON.parse(raw);
+    if (sess.closed) return { hit: null, bypassed: false };
+
+    // Check if the token that opened this session has been revoked/logged out
+    if (sess.tokenHash && env.KV) {
+      var rev = await env.KV.get("revoked:" + sess.tokenHash, { cacheTtl: 60 });
+      if (rev) return { hit: null, bypassed: false };
+    }
+
+    // If VERIFY_JWT is enabled and the client supplies a token (header, query, or cookie),
+    // cryptographically verify it and enforce that it belongs to the session owner!
+    var cred = credential(request, url);
+    if (isJwtVerifyEnabled(env) && cred) {
+      var v = await verifyJwtToken(env, cred);
+      if (!v.valid) return { hit: null, bypassed: false };
+      if (sess.userId && v.userId && sess.userId !== v.userId) {
+        return { hit: null, bypassed: false };
+      }
+    }
+
     var t = (sess.tracks && sess.tracks[n]) || (sess.item ? { key: sess.item + "/track-" + n, size: 0, mime: "" } : null);
     if (!t) return { hit: null, bypassed: false };
     var resp = await buildR2TrackResponse(request, env, ctx, t, false);
@@ -609,7 +773,7 @@ async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, i
   try {
     var r2State = await getR2State(env, false);
     if (r2State.tripped) return null;
-    if (!(await isCredentialValid(request, url))) return null;
+    if (!(await isCredentialValid(env, request, url))) return null;
 
     var rawMap = await env.KV.get("itemmap:" + itemId);
     var mapObj = rawMap ? JSON.parse(rawMap) : null;
@@ -655,12 +819,13 @@ export default {
     var origin = new URL(env.ORIGIN);
 
     if (cp === "/__abs-cache/status" && request.method === "GET") {
-      if (!(await isCredentialValid(request, url))) return new Response("Unauthorized", { status: 401 });
+      if (!(await isCredentialValid(env, request, url))) return new Response("Unauthorized", { status: 401 });
       var st = await getR2State(env, true);
       var lim = getLimits(env);
       return new Response(JSON.stringify({
         month: monthKey().replace("r2:usage:", ""),
         freeTierGuard: lim.guardEnabled ? "yes" : "no",
+        verifyJwt: isJwtVerifyEnabled(env) ? "yes" : "no",
         circuitBreakerTripped: st.tripped,
         reason: st.reason || (lim.guardEnabled ? "OK (within Free Tier safety limits)" : "FREE_TIER_GUARD=no (kill switches disabled)"),
         storage: lim.guardEnabled ? {
@@ -679,7 +844,7 @@ export default {
     var m = cp.match(/^\/public\/session\/([^/]+)\/track\/(\d+)$/);
     var r2Bypassed = false;
     if (m && env.CACHE && env.KV && (request.method === "GET" || request.method === "HEAD")) {
-      var res = await serveFromCache(request, env, ctx, m[1], m[2]);
+      var res = await serveFromCache(request, env, ctx, url, m[1], m[2]);
       if (res.hit) { ctx.waitUntil(record(env, request, res.hit, url, cp)); return res.hit; }
       r2Bypassed = res.bypassed;
     }
@@ -714,17 +879,30 @@ export default {
       ? cp.match(/^\/api\/session\/([^/]+)\/sync$/)
       : null;
     if (syncMatch) {
-      ctx.waitUntil(ensureSessionLearned(env, request.clone(), syncMatch[1]));
+      ctx.waitUntil(ensureSessionLearned(env, request.clone(), url, syncMatch[1]));
     }
+
+    var closeMatch = (request.method === "POST" && env.KV)
+      ? cp.match(/^\/api\/session\/([^/]+)\/close$/)
+      : null;
+
+    var isLogout = (request.method === "POST" && (/^\/logout(\/|$)/.test(cp) || /^\/api\/logout(\/|$)/.test(cp)));
 
     var target = new URL(p + url.search, origin);
     var resp = await fetch(new Request(target.toString(), request), { redirect: "manual" });
 
+    // If user logged out or origin rejected the token with 401/403, immediately revoke the token at the edge
+    if (isLogout || ((cp.indexOf("/api/") === 0 || cp.indexOf("/s/") === 0) && (resp.status === 401 || resp.status === 403))) {
+      ctx.waitUntil(revokeToken(env, request, url));
+    }
+    if (closeMatch && resp.ok) {
+      ctx.waitUntil(closeSessionInKv(env, closeMatch[1]));
+    }
     if (reqCloneForProgress && resp.ok) {
       ctx.waitUntil(checkProgressEviction(env, reqCloneForProgress, cp));
     }
     if (request.method === "POST" && env.KV && resp.ok && /^\/api\/items\/[^/]+\/play(\/[^/]+)?$/.test(cp)) {
-      ctx.waitUntil(learnSession(env, resp.clone()));
+      ctx.waitUntil(learnSession(env, resp.clone(), request, url));
     }
     if (request.method === "GET" && env.KV && resp.status === 200 && /^\/api\/items\/[^/]+$/.test(cp)) {
       ctx.waitUntil(learnItemDetails(env, resp.clone()));
@@ -733,8 +911,8 @@ export default {
         && cp.indexOf("/api/") === 0 && resp.status < 400 && !NOBUMP.test(cp)) {
       ctx.waitUntil(bumpEpoch(env, url.origin + "/__edge/"));
     }
-    if (cp.indexOf("/api/") === 0 && resp.status >= 200 && resp.status < 300) {
-      ctx.waitUntil(markValid(request, url));
+    if (cp.indexOf("/api/") === 0 && resp.status >= 200 && resp.status < 300 && !isLogout) {
+      ctx.waitUntil(markValid(env, request, url));
     }
     var filled = false;
     if (lookup && lookup.fill && resp.status === 200) {

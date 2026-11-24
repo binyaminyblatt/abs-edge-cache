@@ -5,10 +5,13 @@
   "compatibility_date": "2025-11-01",
   "workers_dev": false,
 
-  // Replace with your Audiobookshelf origin URL and your desired Free Tier / Cache settings
+  // Replace with your Audiobookshelf origin URL and your desired Free Tier / Cache / Auth settings
+  // Note: If enabling VERIFY_JWT = "yes", store your Audiobookshelf tokenSecret as an encrypted
+  // Cloudflare Secret using: npx wrangler secret put JWT_SECRET
   "vars": {
     "ORIGIN": "https://audiobookshelf-origin.example.com",
     "FREE_TIER_GUARD": "yes",
+    "VERIFY_JWT": "no",
     "MAX_BUCKET_BYTES": "9000000000",
     "MAX_CLASS_A_MONTH": "800000",
     "MAX_CLASS_B_MONTH": "8000000",

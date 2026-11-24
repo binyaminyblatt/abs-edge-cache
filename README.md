@@ -117,6 +117,29 @@ What if you edit a book's title, match metadata, or upload a new cover? You don'
   * **If the book is ALREADY cached in R2** (because you were streaming it earlier), the Worker verifies your auth token, maps the file inode/filename to the cached R2 track (`itemmap:<itemId>`), and serves the download **straight from Cloudflare R2 at maximum edge speed** (`x-abs-cache: HIT`).
   * **If the book is NOT in R2**, the Worker streams the download directly from your `ORIGIN` server (`x-abs-cache: MISS-NO-STORE`) and **never queues or stores the downloaded book into R2**—since you are saving the book locally on your device, there is no reason to waste R2 cache space on it.
 * **JSON Metadata Cache:** The Worker never serves cached JSON metadata to a token unless your origin server has returned a `2xx` response for that exact token hash within the last **15 minutes** (`/__edge/v/<tokenHash>`).
+* **Immediate Session & Token Revocation (`POST /api/session/:id/close`, `/logout`, `401`/`403`):**
+  * As soon as a playback session closes (`POST /api/session/:id/close`), its `sess:<sid>` mapping is immediately deleted from KV so a closed session URL cannot be replayed against R2.
+  * When a user logs out (`/logout` or `/api/logout`) or if your origin server ever rejects a token with `401`/`403`, the Worker writes a 30-day revocation tombstone (`revoked:<tokenHash>`) in KV, immediately cutting off both edge cache access and any R2 playback session opened by that token.
+* **Optional Cryptographic `HS256` JWT Verification (`VERIFY_JWT = "yes"` + `JWT_SECRET`):**
+  * **Disabled by default (`VERIFY_JWT = "no"`)** so users can deploy without extracting secrets from their server.
+  * **When enabled (`VERIFY_JWT = "yes"` and `JWT_SECRET` set):**
+    1. Every JWT (`Authorization: Bearer <token>`, `?token=<token>`, or cookie) is cryptographically verified at Cloudflare's edge using Web Crypto `HMAC-SHA256` (`HS256`) against Audiobookshelf's `tokenSecret` (`JWT_SECRET`).
+    2. Standard JWT timing claims (`exp` expiration and `nbf` not-before) and KV revocation tombstones (`revoked:<tokenHash>`) are enforced before serving any cached cover, metadata, status readout, or R2 file download.
+    3. Playback sessions (`sess:<sid>`) can only be registered by a cryptographically verified JWT and are bound to that user's `userId` and `tokenHash`. If a third party attempts to use a different user's token or if the session's parent token is revoked/expired, R2 refuses to serve the audio track.
+  * **How to Extract `JWT_SECRET` (`tokenSecret`) from Audiobookshelf:**
+    Audiobookshelf stores its `HS256` signing secret (`tokenSecret`) in `/config/absdatabase.sqlite` inside the `settings` table (`id = 'server-settings'`), or allows overriding it via environment variables if configured. You can extract it with:
+    ```bash
+    # On Linux / macOS / Windows with sqlite3 installed:
+    sqlite3 /path/to/config/absdatabase.sqlite "SELECT json_extract(settings, '$.tokenSecret') FROM settings WHERE id = 'server-settings';"
+
+    # Or if running Audiobookshelf in Docker:
+    docker exec audiobookshelf sqlite3 /config/absdatabase.sqlite "SELECT json_extract(settings, '$.tokenSecret') FROM settings WHERE id = 'server-settings';"
+    ```
+    Then store it as an encrypted Cloudflare Worker Secret and enable `VERIFY_JWT`:
+    ```bash
+    npx wrangler secret put JWT_SECRET
+    # Paste your tokenSecret value when prompted, then set "VERIFY_JWT": "yes" in wrangler.jsonc
+    ```
 * **Unified `/` and `/audiobookshelf` Subpath Support:** Whether a client talks to `/api/...` (mobile apps) or `/audiobookshelf/api/...` (Web UI configured with a router base path), the Worker normalizes the canonical path so both share the exact same edge and R2 cache entries.
 
 ---
@@ -159,6 +182,8 @@ All settings are configured via environment variables (`vars` in `wrangler.jsonc
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `ORIGIN` | *(required)* | Origin URL of your Audiobookshelf instance (must be reachable by Cloudflare, e.g. via Cloudflare Tunnel). |
+| `VERIFY_JWT` | `"no"` | Set to `"yes"` (along with the `JWT_SECRET` Worker Secret) to enable cryptographic `HS256` JWT signature verification, `exp`/`nbf` enforcement, cover-cache auth enforcement, and session-to-user binding at the edge. Disabled (`"no"`) by default. |
+| `JWT_SECRET` | *(optional secret)* | Your Audiobookshelf server's `tokenSecret` (extracted from `/config/absdatabase.sqlite` or your server's env vars). Store via `npx wrangler secret put JWT_SECRET`. |
 | `FREE_TIER_GUARD` | `"yes"` | Set to `"yes"` (default) to enforce the 9.0 GB storage cap and monthly Class A/B kill switches. Set to `"no"` (or `"false"` / `"off"` / `"0"`) to disable all R2 kill switches for paid R2 usage. |
 | `MAX_BUCKET_BYTES` | `"9000000000"` | Maximum R2 bucket size in bytes when `FREE_TIER_GUARD="yes"`. Default is `9,000,000,000` (9.0 GB decimal / ~8.38 GiB), leaving 1.0 GB below R2's 10 GB free tier. |
 | `MAX_BUCKET_MB` | `"9000"` | Alternative to `MAX_BUCKET_BYTES` specified in decimal megabytes (`1 MB = 1,000,000 bytes`). |

@@ -7,6 +7,10 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Optional Cryptographic `HS256` JWT Verification & Session Revocation (`VERIFY_JWT` + `JWT_SECRET`):**
+  - Added optional edge cryptographic verification (`VERIFY_JWT="no"` by default; enabled when `VERIFY_JWT="yes"` and `JWT_SECRET` is set to Audiobookshelf's `tokenSecret`) using Web Crypto `HMAC-SHA256`.
+  - Validates JWT signatures, `exp` / `nbf` claims, and KV revocation tombstones (`revoked:<tokenHash>`) before serving any cached metadata, covers, status, or R2 audio/downloads.
+  - Binds playback sessions (`sess:<sid>`) to the authenticated `userId` and `tokenHash`, immediately deletes `sess:<sid>` from KV on `POST /api/session/:id/close`, and revokes tokens immediately on `/logout` or origin `401`/`403` responses.
 - **Web UI Static Asset & HTML Shell Edge Caching (`/_nuxt/*`, `.js`, `.css`, fonts, icons, SPA HTML):**
   - Cached content-hashed Nuxt JS/CSS bundles (`/_nuxt/*`), fonts, and icons at Cloudflare's edge for 30 days.
   - Cached the Nuxt SPA HTML shell (`/`, `/login`, `/library/*`, etc.) and `/sw.js` with a 5-minute fresh window (`HTML_FRESH_S = 300`) and 24-hour stale-while-revalidate window (`HTML_SWR_S = 86400`).
