@@ -7,6 +7,11 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Offline-Origin Resilience (`STALE-IF-ERROR` & Queued Progress Writes):**
+  - Falls back to serving expired edge-cached covers, library metadata, RSS feeds, and Web UI shell (`x-abs-cache: STALE-IF-ERROR`) if `ORIGIN` is unreachable or returns `502`/`503`/`504`/`520`–`530`.
+  - Queues progress writes (`POST /api/session/:id/sync`, `POST /api/session/:id/close`, `PATCH /api/me/progress*`) into `abs-warm` (`x-abs-cache: QUEUED-OFFLINE`) when `ORIGIN` is offline and automatically replays them once `ORIGIN` recovers.
+- **RSS Feed Edge & R2 Caching (`/feed/:slug` & `/feed/:slug/*`):**
+  - Edge-caches `/feed/:slug` XML feeds (`RSS_FRESH_S = 300`, `RSS_SWR_S = 3600`) and warms/serves RSS `<enclosure>` audio files from R2 with `206` byte-range support.
 - **Sliding-Window Track Warming (`WARM_WINDOW_TRACKS`):**
   - Bounds background R2 warming to `WARM_WINDOW_TRACKS` chapters from the active chapter forward (default `5`; set to `0` to warm the entire book immediately) and automatically advances the window as you listen through multi-file audiobooks.
 - **One-Click Deploy to Cloudflare Button & Test Suite:**

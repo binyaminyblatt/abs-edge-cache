@@ -328,3 +328,133 @@ test("FREE_TIER_GUARD trips circuit breaker when Class A ops reach MAX_CLASS_A_M
   const state = JSON.parse(await env.KV.get("r2:usage:" + month));
   assert.equal(state.tripped, true);
 });
+
+test("STALE-IF-ERROR serves expired edge cache when origin is offline", async () => {
+  let originDown = false;
+  installGlobals(async () => {
+    if (originDown) throw new Error("ECONNREFUSED");
+    return new Response(JSON.stringify({ libraries: [{ id: "lib-1" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  });
+
+  const env = makeEnv({ JSON_FRESH_S: "0", JSON_SWR_S: "0" });
+  const ctx1 = makeCtx();
+  const res1 = await worker.fetch(new Request("https://edge.example.com/api/libraries", {
+    headers: { authorization: "Bearer valid-tok" }
+  }), env, ctx1);
+  assert.equal(res1.status, 200);
+  await ctx1.flush();
+
+  // Origin goes offline; expired cache entry should be served with STALE-IF-ERROR
+  originDown = true;
+  await new Promise((r) => setTimeout(r, 10));
+  const ctx2 = makeCtx();
+  const res2 = await worker.fetch(new Request("https://edge.example.com/api/libraries", {
+    headers: { authorization: "Bearer valid-tok" }
+  }), env, ctx2);
+  assert.equal(res2.status, 200);
+  assert.equal(res2.headers.get("x-abs-cache"), "STALE-IF-ERROR");
+  const body = await res2.json();
+  assert.equal(body.libraries[0].id, "lib-1");
+});
+
+test("offline progress writes are queued and replayed when origin recovers, while non-progress POSTs fail with 502", async () => {
+  let originStatus = 503;
+  const replayed = [];
+  installGlobals(async (req, opts) => {
+    const url = typeof req === "string" ? req : req.url;
+    if (originStatus >= 500) return new Response("Unavailable", { status: originStatus });
+    const method = typeof req === "string" ? ((opts && opts.method) || "GET") : req.method;
+    const body = typeof req === "string" ? ((opts && opts.body) || "") : await req.text();
+    replayed.push({ url, method, body });
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+
+  const env = makeEnv();
+  const ctx = makeCtx();
+
+  // Progress sync while origin is down -> queued & 200 OK
+  const syncRes = await worker.fetch(new Request("https://edge.example.com/api/session/s1/sync", {
+    method: "POST",
+    headers: { authorization: "Bearer tok", "content-type": "application/json" },
+    body: JSON.stringify({ currentTime: 420 })
+  }), env, ctx);
+  assert.equal(syncRes.status, 200);
+  assert.equal(syncRes.headers.get("x-abs-cache"), "QUEUED-OFFLINE");
+  assert.equal(env.WARM.sent.length, 1);
+  assert.equal(env.WARM.sent[0].type, "progress");
+
+  // Non-progress POST while origin is down -> NOT queued, passes through 503
+  const playRes = await worker.fetch(new Request("https://edge.example.com/api/items/b1/play", {
+    method: "POST",
+    headers: { authorization: "Bearer tok" }
+  }), env, ctx);
+  assert.equal(playRes.status, 503);
+  assert.equal(env.WARM.sent.length, 1);
+
+  // Queue replay while origin is still down -> retry()
+  let retried = 0, acked = 0;
+  await worker.queue({
+    messages: [{ body: env.WARM.sent[0], ack() { acked++; }, retry() { retried++; } }]
+  }, env);
+  assert.equal(retried, 1);
+  assert.equal(acked, 0);
+
+  // Origin recovers -> ack() and progress body replayed
+  originStatus = 200;
+  await worker.queue({
+    messages: [{ body: env.WARM.sent[0], ack() { acked++; }, retry() { retried++; } }]
+  }, env);
+  assert.equal(acked, 1);
+  assert.equal(replayed.length, 1);
+  assert.equal(JSON.parse(replayed[0].body).currentTime, 420);
+});
+
+test("RSS feed XML and audio enclosures are cached at edge and in R2", async () => {
+  let originHits = 0;
+  installGlobals(async (req) => {
+    originHits++;
+    const url = typeof req === "string" ? req : req.url;
+    if (url.endsWith("/feed/my-slug")) {
+      return new Response("<rss><channel><title>Book</title></channel></rss>", {
+        status: 200,
+        headers: { "content-type": "application/rss+xml" }
+      });
+    }
+    return new Response("RSSAUDIO99", {
+      status: 200,
+      headers: { "content-length": "10", "content-type": "audio/mpeg" }
+    });
+  });
+
+  const env = makeEnv();
+  const ctx = makeCtx();
+
+  // 1. RSS XML miss -> hit
+  const rss1 = await worker.fetch(new Request("https://edge.example.com/feed/my-slug"), env, ctx);
+  assert.equal(rss1.status, 200);
+  await ctx.flush();
+  const rss2 = await worker.fetch(new Request("https://edge.example.com/feed/my-slug"), env, ctx);
+  assert.equal(rss2.status, 200);
+  assert.equal(rss2.headers.get("x-abs-cache"), "HIT");
+
+  // 2. RSS audio miss queues rss-track job, then queue warms R2, then 206 HIT from R2
+  const aud1 = await worker.fetch(new Request("https://edge.example.com/feed/my-slug/ch1.mp3"), env, ctx);
+  assert.equal(aud1.status, 200);
+  await ctx.flush();
+  assert.equal(env.WARM.sent.length, 1);
+  assert.equal(env.WARM.sent[0].type, "rss-track");
+
+  await worker.queue({
+    messages: [{ body: env.WARM.sent[0], ack() {}, retry() {} }]
+  }, env);
+
+  const aud2 = await worker.fetch(new Request("https://edge.example.com/feed/my-slug/ch1.mp3", {
+    headers: { range: "bytes=0-2" }
+  }), env, ctx);
+  assert.equal(aud2.status, 206);
+  assert.equal(aud2.headers.get("x-abs-cache"), "HIT");
+  assert.equal(await aud2.text(), "RSS");
+});
