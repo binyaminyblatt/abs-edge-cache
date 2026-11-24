@@ -129,7 +129,7 @@ What if you edit a book's title, match metadata, or upload a new cover? You don'
   * As soon as a playback session closes (`POST /api/session/:id/close`), its `sess:<sid>` mapping is immediately deleted from KV so a closed session URL cannot be replayed against R2.
   * When a user logs out (`/logout` or `/api/logout`) or if your origin server ever rejects a token with `401`/`403`, the Worker writes a 30-day revocation tombstone (`revoked:<tokenHash>`) in KV, immediately cutting off both edge cache access and any R2 playback session opened by that token.
 * **Optional Cryptographic `HS256` JWT Verification (`VERIFY_JWT = "yes"` + `JWT_SECRET`):**
-  * **Disabled by default (`VERIFY_JWT = "no"`)** so users can deploy without extracting secrets from their server.
+  * **Disabled by default (`VERIFY_JWT = "no"`)** so users can test quickly without extracting secrets from their server — **however, we very highly recommend enabling `VERIFY_JWT = "yes"` for any public or production deployment**. Without it, cover images are cached publicly and token validity relies on a 15-minute edge cache rather than cryptographic verification on every request.
   * **When enabled (`VERIFY_JWT = "yes"` and `JWT_SECRET` set):**
     1. Every JWT (`Authorization: Bearer <token>`, `?token=<token>`, or cookie) is cryptographically verified at Cloudflare's edge using Web Crypto `HMAC-SHA256` (`HS256`) against Audiobookshelf's `tokenSecret` (`JWT_SECRET`).
     2. Standard JWT timing claims (`exp` expiration and `nbf` not-before) and KV revocation tombstones (`revoked:<tokenHash>`) are enforced before serving any cached cover, metadata, status readout, or R2 file download.
