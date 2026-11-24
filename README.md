@@ -140,14 +140,18 @@ What if you edit a book's title, match metadata, or upload a new cover? You don'
     # On Linux / macOS / Windows with sqlite3 installed:
     sqlite3 /path/to/config/absdatabase.sqlite "SELECT json_extract(settings, '$.tokenSecret') FROM settings WHERE id = 'server-settings';"
 
-    # Or if running Audiobookshelf in Docker:
+    # Or if running Audiobookshelf in Docker (if sqlite3 is installed in the container):
     docker exec audiobookshelf sqlite3 /config/absdatabase.sqlite "SELECT json_extract(settings, '$.tokenSecret') FROM settings WHERE id = 'server-settings';"
+
+    # Or using Python on the host if sqlite3 CLI is not installed:
+    python3 -c "import sqlite3, json; c=sqlite3.connect('/path/to/config/absdatabase.sqlite'); print(json.loads(c.execute(\"SELECT settings FROM settings WHERE id='server-settings'\").fetchone()[0])['tokenSecret'])"
     ```
     Then store it as an encrypted Cloudflare Worker Secret and enable `VERIFY_JWT`:
     ```bash
     npx wrangler secret put JWT_SECRET
     # Paste your tokenSecret value when prompted, then set "VERIFY_JWT": "yes" in wrangler.jsonc
     ```
+    *(If you used the **Deploy to Cloudflare** button, you can also add `JWT_SECRET` as a **Secret** and set `VERIFY_JWT` to `yes` directly in **Cloudflare Dashboard → Workers & Pages → `abs-edge-cache` → Settings → Variables and Secrets**.)*
 * **Edge Brute-Force Login Rate Limiter (`MAX_LOGIN_ATTEMPTS`):** Failed `POST /login` or `POST /api/login` attempts are counted per client IP (`CF-Connecting-IP`). After `5` failed attempts, the IP is blocked at Cloudflare's edge with `429 Too Many Requests` for 15 minutes before reaching your home server.
 * **Device-Platform & Geo-Country Session Lock (`SESSION_LOCK = "yes"`):** Playback sessions (`sess:<sid>`) are bound to the originating country (`cf.country`) and player OS family (e.g. `apple-media`, `android`, `windows`). Your phone can freely roam between Wi-Fi and cellular on the same device, while cross-country or cross-OS session replay attempts are blocked with `403 Forbidden`.
 * **Hardened Security Headers:** Every response sets `Referrer-Policy: no-referrer` (preventing `?token=` or `/public/session/:sid/` leaks in `Referer` headers), `X-Content-Type-Options: nosniff`, and `X-Frame-Options: SAMEORIGIN`, while preserving Audiobookshelf's own CORS/CSP headers.
