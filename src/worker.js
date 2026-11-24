@@ -50,8 +50,12 @@ function isFreeTierGuardEnabled(env) {
   return isTruthyFlag(env.FREE_TIER_GUARD, true);
 }
 
+function isJwtRequested(env) {
+  return isTruthyFlag(env.VERIFY_JWT, false);
+}
+
 function isJwtVerifyEnabled(env) {
-  return isTruthyFlag(env.VERIFY_JWT, false) && Boolean(env.JWT_SECRET && String(env.JWT_SECRET).trim());
+  return isJwtRequested(env) && Boolean(env.JWT_SECRET && String(env.JWT_SECRET).trim());
 }
 
 function isSessionLockEnabled(env) {
@@ -216,6 +220,7 @@ function shape(pathname) {
 
 async function record(env, request, resp, url, cp) {
   try {
+    if (!isTruthyFlag(env.PROBE_LOG, false)) return;
     if (!env.KV || !APP_PATH.test(cp)) return;
     var ua = (request.headers.get("user-agent") || "none").slice(0, 80);
     var cf = request.cf || {};
@@ -238,7 +243,15 @@ async function record(env, request, resp, url, cp) {
 function normalizeClientIp(ip) {
   if (!ip || ip === "unknown") return "unknown";
   if (ip.indexOf(":") !== -1) {
-    return ip.split(":").slice(0, 4).join(":") + "::/64";
+    var clean = ip.split("%")[0].toLowerCase();
+    var halves = clean.split("::");
+    var left = halves[0] ? halves[0].split(":").filter(Boolean) : [];
+    var right = halves.length > 1 && halves[1] ? halves[1].split(":").filter(Boolean) : [];
+    var missing = Math.max(0, 8 - (left.length + right.length));
+    var full = left.concat(Array(missing).fill("0000")).concat(right).slice(0, 8).map(function (g) {
+      return g.padStart(4, "0");
+    });
+    return full.slice(0, 4).join(":") + "::/64";
   }
   return ip;
 }
@@ -261,13 +274,8 @@ async function checkLoginRateLimit(env, request, url) {
 
 async function recordLoginResult(env, url, ip, success) {
   try {
-    if (!ip || ip === "unknown") return;
+    if (!ip || ip === "unknown" || success) return;
     var cacheKey = url.origin + "/__edge/loginfail/" + ip;
-    if (success) {
-      await caches.default.delete(cacheKey);
-      if (env.KV) await env.KV.delete("loginfail:" + ip);
-      return;
-    }
     var hit = await caches.default.match(cacheKey);
     var count = hit ? (parseInt(await hit.text(), 10) || 0) : 0;
     if (env.KV) {
@@ -414,12 +422,28 @@ async function isCredentialValid(env, request, url) {
     var rev = await env.KV.get("revoked:" + ch, { cacheTtl: 60 });
     if (rev) return false;
   }
+  var k = url.origin + "/__edge/v/" + ch;
+  var recentlyValid = Boolean(await caches.default.match(k));
   if (isJwtVerifyEnabled(env)) {
     var v = await verifyJwtToken(env, cred);
-    return v.valid;
+    if (!v.valid) return false;
+    if (recentlyValid) return true;
+    try {
+      var meResp = await fetch(new URL("/api/me", new URL(env.ORIGIN)).toString(), {
+        headers: { "authorization": "Bearer " + cred },
+        cf: { cacheTtl: 0 },
+      });
+      if (meResp.ok) {
+        await markValid(env, request, url);
+        return true;
+      }
+      if (isOriginDownStatus(meResp.status)) return true;
+      return false;
+    } catch (e) {
+      return true;
+    }
   }
-  var k = url.origin + "/__edge/v/" + ch;
-  return Boolean(await caches.default.match(k));
+  return recentlyValid;
 }
 
 // ---------- edge cache for Web UI assets (HTML/CSS/JS), covers, static & progress-aware metadata ----------
@@ -856,11 +880,20 @@ async function ensureSessionLearned(env, request, url, sid) {
   } catch (e) {}
 }
 
+function contentDispositionAttachment(filename) {
+  var ascii = filename.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "");
+  var encoded = encodeURIComponent(filename).replace(/['()*]/g, function (c) {
+    return "%" + c.charCodeAt(0).toString(16).toUpperCase();
+  });
+  return 'attachment; filename="' + ascii + "\"; filename*=UTF-8''" + encoded;
+}
+
 async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
   if (request.method === "HEAD") {
     ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
     var h = await env.CACHE.head(t.key);
     if (!h) return null;
+    if (t.size > 0 && h.size !== t.size) return null;
     var hh = new Headers();
     h.writeHttpMetadata(hh);
     hh.set("content-length", String(h.size));
@@ -870,7 +903,7 @@ async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
     hh.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
     if (t.mime) hh.set("content-type", t.mime);
     if (isDownload && t.filename) {
-      hh.set("content-disposition", 'attachment; filename="' + t.filename.replace(/"/g, "") + '"');
+      hh.set("content-disposition", contentDispositionAttachment(t.filename));
     }
     applySecurityHeaders(hh);
     var notModHead = checkNotModified(request, hh, "HIT");
@@ -881,6 +914,7 @@ async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
   ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
   var obj = await env.CACHE.get(t.key, rangeHdr ? { range: request.headers } : {});
   if (!obj) return null;
+  if (t.size > 0 && obj.size !== t.size) return null;
   var headers = new Headers();
   obj.writeHttpMetadata(headers);
   headers.set("etag", obj.httpEtag);
@@ -889,7 +923,7 @@ async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
   headers.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
   if (t.mime) headers.set("content-type", t.mime);
   if (isDownload && t.filename) {
-    headers.set("content-disposition", 'attachment; filename="' + t.filename.replace(/"/g, "") + '"');
+    headers.set("content-disposition", contentDispositionAttachment(t.filename));
   }
   applySecurityHeaders(headers);
   var notMod = checkNotModified(request, headers, "HIT");
@@ -962,11 +996,47 @@ async function serveFromCache(request, env, ctx, url, sid, n) {
   } catch (e) { return { hit: null, bypassed: false, forbidden: false }; }
 }
 
+async function checkOriginDownloadPermission(request, env, url) {
+  var cred = credential(request, url);
+  if (!cred) return { allowed: false, response: null };
+  var permHash = await sha16(cred + "|" + url.pathname);
+  var permKey = url.origin + "/__edge/dlperm/" + permHash;
+  if (await caches.default.match(permKey)) return { allowed: true, response: null };
+  try {
+    var originUrl = new URL(url.pathname + url.search, new URL(env.ORIGIN)).toString();
+    var headers = new Headers(request.headers);
+    headers.set("range", "bytes=0-0");
+    var probeResp = await fetch(originUrl, {
+      method: "GET",
+      headers: headers,
+      redirect: "manual",
+      cf: { cacheTtl: 0 },
+    });
+    if (probeResp.ok || probeResp.status === 206) {
+      if (probeResp.body) await probeResp.body.cancel();
+      await caches.default.put(permKey, new Response("1", {
+        headers: { "cache-control": "public, max-age=60" },
+      }));
+      return { allowed: true, response: null };
+    }
+    var deniedHeaders = new Headers(probeResp.headers);
+    applySecurityHeaders(deniedHeaders);
+    return {
+      allowed: false,
+      response: new Response(probeResp.body, { status: probeResp.status, headers: deniedHeaders }),
+    };
+  } catch (e) {
+    return { allowed: false, response: null };
+  }
+}
+
 async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, ino, filename, isExplicitDownload) {
   try {
     var r2State = await getR2State(env, false);
     if (r2State.tripped) return null;
     if (!(await isCredentialValid(env, request, url))) return null;
+    var perm = await checkOriginDownloadPermission(request, env, url);
+    if (!perm.allowed) return perm.response;
 
     var rawMap = await env.KV.get("itemmap:" + itemId);
     var mapObj = rawMap ? JSON.parse(rawMap) : null;
@@ -1004,15 +1074,14 @@ async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, i
 async function serveRssAudioFromCache(request, env, ctx, cp, slug, restPath) {
   try {
     var r2State = await getR2State(env, false);
-    if (r2State.tripped) return { hit: null, bypassed: true };
+    if (r2State.tripped) return { hit: null, bypassed: true, key: "" };
     var key = "rss/" + slug + "/" + (await sha16(restPath));
     var resp = await buildR2TrackResponse(request, env, ctx, { key: key, mime: "" }, false);
     if (!resp) {
-      ctx.waitUntil(enqueueTrackJob(env, { type: "rss-track", item: "rss-" + slug, path: cp, key: key }));
-      return { hit: null, bypassed: false };
+      return { hit: null, bypassed: false, key: key };
     }
-    return { hit: resp, bypassed: false };
-  } catch (e) { return { hit: null, bypassed: false }; }
+    return { hit: resp, bypassed: false, key: key };
+  } catch (e) { return { hit: null, bypassed: false, key: "" }; }
 }
 
 async function queueOfflineProgressWrite(env, request, url, cp, bodyText) {
@@ -1036,26 +1105,9 @@ async function queueOfflineProgressWrite(env, request, url, cp, bodyText) {
   } catch (e) { return false; }
 }
 
-async function handleFetch(request, env, ctx) {
-    var url = new URL(request.url);
+async function handleFetch(request, env, ctx, url, cp, isLoginPost, loginCheck) {
     var p = url.pathname;
-    if (BLOCK_DOT.test(p) || BLOCK_PATH.test(p) || BLOCK_EXT.test(p)) {
-      return new Response("Not found", { status: 404 });
-    }
-    var cp = stripBase(p);
     var origin = new URL(env.ORIGIN);
-
-    // Edge Brute-Force Login Rate Limiter (5 failed attempts -> 15 min block at edge)
-    var isLoginPost = (request.method === "POST" && (/^\/login(\/|$)/.test(cp) || /^\/api\/login(\/|$)/.test(cp)));
-    var loginCheck = isLoginPost ? await checkLoginRateLimit(env, request, url) : null;
-    if (loginCheck && loginCheck.blocked) {
-      var rlHeaders = new Headers({ "content-type": "application/json", "retry-after": "900" });
-      applySecurityHeaders(rlHeaders);
-      return new Response(JSON.stringify({ error: "Too many failed login attempts. Please try again in 15 minutes." }), {
-        status: 429,
-        headers: rlHeaders
-      });
-    }
 
     if (cp === "/__abs-cache/status" && request.method === "GET") {
       if (!(await isCredentialValid(env, request, url))) return new Response("Unauthorized", { status: 401 });
@@ -1103,7 +1155,14 @@ async function handleFetch(request, env, ctx) {
     if ((dlIno || dlFile) && env.CACHE && env.KV && (request.method === "GET" || request.method === "HEAD")) {
       var dlItemId = dlIno ? dlIno[1] : dlFile[1];
       var ino = dlIno ? dlIno[2] : "";
-      var fname = dlFile ? decodeURIComponent(dlFile[2]) : "";
+      var fname = "";
+      if (dlFile) {
+        try {
+          fname = decodeURIComponent(dlFile[2]);
+        } catch (e) {
+          return new Response("Bad Request", { status: 400 });
+        }
+      }
       var isExplicitDl = Boolean(dlIno && dlIno[3]);
       var dlHit = await serveDownloadFromCacheIfPresent(request, env, ctx, url, dlItemId, ino, fname, isExplicitDl);
       if (dlHit) { ctx.waitUntil(record(env, request, dlHit, url, cp)); return dlHit; }
@@ -1111,8 +1170,9 @@ async function handleFetch(request, env, ctx) {
 
     // 3. RSS Feed Audio Enclosures (/feed/:slug/:file...): serves from R2 and warms on miss
     var rssAudio = cp.match(/^\/feed\/([^/]+)\/(.+)$/);
+    var rssRes = null;
     if (rssAudio && env.CACHE && (request.method === "GET" || request.method === "HEAD")) {
-      var rssRes = await serveRssAudioFromCache(request, env, ctx, cp, rssAudio[1], rssAudio[2]);
+      rssRes = await serveRssAudioFromCache(request, env, ctx, cp, rssAudio[1], rssAudio[2]);
       if (rssRes.hit) { ctx.waitUntil(record(env, request, rssRes.hit, url, cp)); return rssRes.hit; }
       if (rssRes.bypassed) r2Bypassed = true;
     }
@@ -1234,6 +1294,9 @@ async function handleFetch(request, env, ctx) {
       }
     }
 
+    if (rssAudio && rssRes && !rssRes.hit && !rssRes.bypassed && rssRes.key && (resp.status === 200 || resp.status === 206)) {
+      ctx.waitUntil(enqueueTrackJob(env, { type: "rss-track", item: "rss-" + rssAudio[1], path: cp, key: rssRes.key }));
+    }
     if (resp.status === 101) { ctx.waitUntil(record(env, request, resp, url, cp)); return resp; }
     var out = new Response(resp.body, resp);
     var loc = out.headers.get("location");
@@ -1254,12 +1317,37 @@ async function handleFetch(request, env, ctx) {
 
 export default {
   async fetch(request, env, ctx) {
-    var failOpenReq = request.clone();
+    var url = new URL(request.url);
+    var p = url.pathname;
+    if (BLOCK_DOT.test(p) || BLOCK_PATH.test(p) || BLOCK_EXT.test(p)) {
+      return new Response("Not found", { status: 404 });
+    }
+    if (isJwtRequested(env) && !isJwtVerifyEnabled(env)) {
+      console.error("VERIFY_JWT is enabled but JWT_SECRET is not configured; failing closed.");
+      return new Response("Server configuration error", { status: 500 });
+    }
+    var cp = stripBase(p);
+    var isLoginPost = (request.method === "POST" && (/^\/login(\/|$)/.test(cp) || /^\/api\/login(\/|$)/.test(cp)));
+    var loginCheck = isLoginPost ? await checkLoginRateLimit(env, request, url) : null;
+    if (loginCheck && loginCheck.blocked) {
+      var rlHeaders = new Headers({ "content-type": "application/json", "retry-after": "900" });
+      applySecurityHeaders(rlHeaders);
+      return new Response(JSON.stringify({ error: "Too many failed login attempts. Please try again in 15 minutes." }), {
+        status: 429,
+        headers: rlHeaders
+      });
+    }
+
+    var failOpenReq = null;
     try {
-      return await handleFetch(request, env, ctx);
+      var canCloneForFailOpen = !isLoginPost && (!request.body || (Number(request.headers.get("content-length") || "0") <= 1048576));
+      if (canCloneForFailOpen) failOpenReq = request.clone();
+      return await handleFetch(request, env, ctx, url, cp, isLoginPost, loginCheck);
     } catch (e) {
+      if (!failOpenReq) {
+        return new Response("Service unavailable", { status: 503 });
+      }
       try {
-        var url = new URL(failOpenReq.url);
         var origin = new URL(env.ORIGIN);
         var resp = await fetch(new Request(new URL(url.pathname + url.search, origin).toString(), failOpenReq), { redirect: "manual" });
         var out = new Response(resp.body, resp);
@@ -1351,6 +1439,6 @@ export default {
         msg.ack();
       } catch (e) { msg.retry(); }
     }
-    if (lim.guardEnabled && !r2Skip) await recordR2Ops(env, 0, 0, currentTotal, true);
+    if (lim.guardEnabled) await recordR2Ops(env, 0, 0, currentTotal, true);
   }
 };

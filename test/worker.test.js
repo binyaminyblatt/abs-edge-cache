@@ -247,7 +247,7 @@ test("SESSION_LOCK blocks cross-country and cross-OS replay with 403", async () 
     item: "book-1",
     userId: "u1",
     country: "US",
-    playerFamily: "apple",
+    playerFamily: "apple-media",
     closed: false,
     tracks: { "1": { key: "book-1/track-1", size: 10, mime: "audio/mpeg" } }
   }));
@@ -486,6 +486,9 @@ test("RSS feed XML and audio enclosures are cached at edge and in R2", async () 
 
 test("top-level fetch fails open to origin on unexpected internal error", async () => {
   installGlobals(async () => new Response("origin-ok", { status: 200 }));
+  // Pass a malformed env.ORIGIN or force an internal throw? Instead, pass a broken request.url getter?
+  // Simpler: pass a custom env where ORIGIN is valid but caches.default.match throws, or test normal fail-open:
+  // Trigger an unexpected throw inside handleFetch by making request.headers.get throw on first call
   const env = makeEnv();
   const ctx = makeCtx();
   const origReq = new Request("https://edge.example.com/api/ping");
@@ -500,9 +503,165 @@ test("top-level fetch fails open to origin on unexpected internal error", async 
       return typeof val === "function" ? val.bind(target) : val;
     }
   });
+  // Note: request.clone() is called before handleFetch, so let's make clone() return origReq
   proxyReq.clone = () => origReq;
   const res = await worker.fetch(proxyReq, env, ctx);
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("x-abs-cache"), "FAIL-OPEN");
   assert.equal(await res.text(), "origin-ok");
+});
+
+test("cached download verifies origin permission (blocks 403) and formats non-ASCII Content-Disposition", async () => {
+  installGlobals(async (req, opts) => {
+    const url = typeof req === "string" ? req : req.url;
+    const hdrs = typeof req === "string" ? new Headers(opts && opts.headers) : req.headers;
+    const auth = hdrs.get("authorization") || "";
+    if (url.endsWith("/api/me")) {
+      return new Response(JSON.stringify({ id: "u1" }), { status: 200 });
+    }
+    if (url.includes("/api/items/b1/file/ino1/download")) {
+      if (auth === "Bearer restricted-tok") {
+        return new Response("Forbidden", { status: 403 });
+      }
+      return new Response("A", { status: 206, headers: { "content-range": "bytes 0-0/10" } });
+    }
+    return new Response("ok", { status: 200 });
+  });
+
+  const env = makeEnv();
+  const ctx = makeCtx();
+  await env.CACHE.put("b1/track-1", Buffer.from("0123456789"), {
+    httpMetadata: { contentType: "audio/mpeg" }
+  });
+  await env.KV.put("itemmap:b1", JSON.stringify({
+    count: 1,
+    byIno: { ino1: { key: "b1/track-1", size: 10, mime: "audio/mpeg", filename: "Book — Ch 1 (א).mp3" } },
+    byFile: {}
+  }));
+
+  // Prime credential validity for restricted-tok via /api/me
+  await worker.fetch(new Request("https://edge.example.com/api/me", {
+    headers: { authorization: "Bearer restricted-tok" }
+  }), env, ctx);
+  await ctx.flush();
+
+  // Restricted user gets 403 from origin check and does NOT receive cached R2 file
+  const denied = await worker.fetch(new Request("https://edge.example.com/api/items/b1/file/ino1/download", {
+    headers: { authorization: "Bearer restricted-tok" }
+  }), env, ctx);
+  assert.equal(denied.status, 403);
+
+  // Permitted user gets cached R2 file with RFC 5987 Content-Disposition
+  await worker.fetch(new Request("https://edge.example.com/api/me", {
+    headers: { authorization: "Bearer allowed-tok" }
+  }), env, ctx);
+  await ctx.flush();
+
+  const ok = await worker.fetch(new Request("https://edge.example.com/api/items/b1/file/ino1/download", {
+    headers: { authorization: "Bearer allowed-tok" }
+  }), env, ctx);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get("x-abs-cache"), "HIT");
+  const cd = ok.headers.get("content-disposition") || "";
+  assert.ok(cd.includes('filename="Book _ Ch 1 (_).mp3"'));
+  assert.ok(cd.includes("filename*=UTF-8''Book%20%E2%80%94%20Ch%201%20%28%D7%90%29.mp3"));
+});
+
+test("VERIFY_JWT=yes without JWT_SECRET fails closed with 500", async () => {
+  installGlobals(async () => new Response("origin-should-not-run", { status: 200 }));
+  const env = makeEnv({ VERIFY_JWT: "yes", JWT_SECRET: "" });
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://edge.example.com/api/me"), env, ctx);
+  assert.equal(res.status, 500);
+});
+
+test("PROBE_LOG is off by default and does not write probe keys to KV", async () => {
+  installGlobals(async () => new Response("ok", { status: 200 }));
+  const env = makeEnv();
+  const ctx = makeCtx();
+  await worker.fetch(new Request("https://edge.example.com/api/ping"), env, ctx);
+  await ctx.flush();
+  const probeKeys = Array.from(env.KV.store.keys()).filter((k) => k.startsWith("p:"));
+  assert.equal(probeKeys.length, 0);
+});
+
+test("RSS audio miss does not enqueue warm job when origin returns 404", async () => {
+  installGlobals(async () => new Response("Not Found", { status: 404 }));
+  const env = makeEnv();
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://edge.example.com/feed/my-slug/missing.mp3"), env, ctx);
+  assert.equal(res.status, 404);
+  await ctx.flush();
+  assert.equal(env.WARM.sent.length, 0);
+});
+
+test("stale R2 object with mismatched size is treated as cache miss", async () => {
+  installGlobals(async () => new Response("FRESH_ORIGIN_AUDIO", { status: 200 }));
+  const env = makeEnv();
+  const ctx = makeCtx();
+  await env.CACHE.put("b1/track-1", Buffer.from("SHORT"), {
+    httpMetadata: { contentType: "audio/mpeg" }
+  });
+  await env.KV.put("sess:s1", JSON.stringify({
+    item: "b1",
+    tracks: { "1": { key: "b1/track-1", size: 18, mime: "audio/mpeg" } },
+    trackOrder: ["1"]
+  }));
+
+  const res = await worker.fetch(new Request("https://edge.example.com/public/session/s1/track/1"), env, ctx);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("x-abs-cache"), "MISS");
+  assert.equal(await res.text(), "FRESH_ORIGIN_AUDIO");
+});
+
+test("compressed IPv6 addresses share /64 login rate-limit bucket and 200 login does not reset counter", async () => {
+  let nextStatus = 401;
+  installGlobals(async () => new Response("auth", { status: nextStatus }));
+  const env = makeEnv({ MAX_LOGIN_ATTEMPTS: "3" });
+  const ctx = makeCtx();
+
+  for (const ip of ["2001:db8::1", "2001:0db8:0000:0000::2"]) {
+    const r = await worker.fetch(new Request("https://edge.example.com/login", {
+      method: "POST",
+      headers: { "cf-connecting-ip": ip },
+      body: "{}"
+    }), env, ctx);
+    assert.equal(r.status, 401);
+    await ctx.flush();
+  }
+
+  // Successful login should NOT reset the failed-attempt counter
+  nextStatus = 200;
+  const ok = await worker.fetch(new Request("https://edge.example.com/login", {
+    method: "POST",
+    headers: { "cf-connecting-ip": "2001:db8:0:0::3" },
+    body: "{}"
+  }), env, ctx);
+  assert.equal(ok.status, 200);
+  await ctx.flush();
+
+  // Third failed attempt from another address in the same /64 triggers 429 on fourth
+  nextStatus = 401;
+  const r3 = await worker.fetch(new Request("https://edge.example.com/login", {
+    method: "POST",
+    headers: { "cf-connecting-ip": "2001:db8::4" },
+    body: "{}"
+  }), env, ctx);
+  assert.equal(r3.status, 401);
+  await ctx.flush();
+
+  const blocked = await worker.fetch(new Request("https://edge.example.com/login", {
+    method: "POST",
+    headers: { "cf-connecting-ip": "2001:db8::5" },
+    body: "{}"
+  }), env, ctx);
+  assert.equal(blocked.status, 429);
+});
+
+test("malformed URI on /s/item/:id/:file returns 400 Bad Request", async () => {
+  installGlobals(async () => new Response("ok", { status: 200 }));
+  const env = makeEnv();
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://edge.example.com/s/item/b1/%E0%A4%A"), env, ctx);
+  assert.equal(res.status, 400);
 });
