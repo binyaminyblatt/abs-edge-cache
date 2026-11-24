@@ -1,6 +1,6 @@
 // abs-edge-cache: Cloudflare Worker front door for Audiobookshelf
 // - blocks scanner/bot paths, proxies everything else to ORIGIN (supports root and /audiobookshelf base path)
-// - edge-caches covers and static metadata (invalidated on edits seen by this Worker)
+// - edge-caches Web UI HTML shell, CSS, JS (_nuxt/*), fonts, icons, book covers, and static metadata
 // - learns playback sessions, serves cached audio from R2, warms cache via Queue ONLY on active playback
 // - accelerates offline book downloads (/api/items/:id/file/:ino, /s/item/:id/:file) from R2 if ALREADY cached,
 //   without warming/storing downloaded books into R2 on a miss
@@ -12,8 +12,10 @@ const FILE_RE = /\.(mp3|m4b|m4a|flac|ogg|opus|aac|wav|jpg|jpeg|png|webp|m3u8|ts|
 const BLOCK_DOT = /\/\.(?!well-known\/)/;
 const BLOCK_PATH = /^\/(actuator|_vti|wp-|wordpress|phpmyadmin|cgi-bin|server-status|vendor\/|xmlrpc|boaform|HNAP1|ecp\/|owa\/|solr\/|jenkins|manager\/html)/i;
 const BLOCK_EXT = /\.(php\d?|aspx?|jsp|cgi|sql|bak|ini|ya?ml|conf|env|git|log|swp|tar|gz|zip)$/i;
-const APP_PATH = /^\/(api|public|s|hls|socket\.io|login|logout|status|ping|auth|feed)(\/|$)/;
+const APP_PATH = /^\/(api|public|s|hls|socket\.io|login|logout|status|ping|auth|feed|_nuxt)(\/|$)/;
 const NOBUMP = /^\/api\/(session|me|authorize|items\/[^/]+\/play)(\/|$)/;
+const STATIC_ASSET_RE = /^\/_nuxt\/.+|\.(css|js|mjs|woff2?|ttf|otf|eot|svg|ico|webp|png|jpg|jpeg|gif|webmanifest|map)$/i;
+const NON_HTML_PREFIX = /^\/(api|public|s|hls|socket\.io|auth|feed|logout|status|ping)(\/|$)/;
 
 const DEFAULT_MAX_BUCKET_BYTES = 9000000000;
 const DEFAULT_MAX_CLASS_A = 800000;
@@ -171,7 +173,7 @@ async function record(env, request, resp, url, cp) {
   } catch (e) {}
 }
 
-// ---------- edge cache for covers + static metadata ----------
+// ---------- edge cache for Web UI assets (HTML/CSS/JS), covers & static metadata ----------
 
 async function sha16(s) {
   var d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -202,8 +204,14 @@ function normQuery(url) {
   return ps.join("&");
 }
 
-function classify(cp, search) {
+function classify(cp, search, request) {
   if (/^\/api\/items\/[^/]+\/cover$/.test(cp) || /^\/api\/authors\/[^/]+\/image$/.test(cp)) return "cover";
+  if (cp.indexOf("/api/") !== 0 && !NON_HTML_PREFIX.test(cp)) {
+    if (cp === "/sw.js") return "html"; // Service worker gets short HTML-like fresh+SWR window
+    if (STATIC_ASSET_RE.test(cp)) return "asset";
+    var accept = request.headers.get("accept") || "";
+    if (accept.indexOf("text/html") !== -1) return "html";
+  }
   if (/progress|rssfeed/i.test(search)) return null;
   if (/^\/api\/libraries$/.test(cp)
     || /^\/api\/libraries\/[^/]+(\/(items|series|authors|collections|filterdata|stats))?$/.test(cp)
@@ -230,14 +238,19 @@ async function bumpEpoch(env, base) {
   } catch (e) {}
 }
 
-async function store(key, resp, ttl) {
+async function store(key, resp, ttl, kind) {
   try {
+    if (kind === "html") {
+      var ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (ct.indexOf("text/html") === -1 && ct.indexOf("javascript") === -1) return false;
+    }
     var h = new Headers(resp.headers);
     h.delete("set-cookie"); h.delete("content-encoding"); h.delete("content-length");
     h.set("x-cached-at", String(Date.now()));
     h.set("cache-control", "max-age=" + ttl);
     await caches.default.put(key, new Response(resp.body, { status: 200, headers: h }));
-  } catch (e) {}
+    return true;
+  } catch (e) { return false; }
 }
 
 function tag(hit, label) {
@@ -264,11 +277,11 @@ async function isCredentialValid(request, url) {
   return Boolean(await caches.default.match(k));
 }
 
-async function refresh(request, env, url, key, ttl) {
+async function refresh(request, env, url, key, ttl, kind) {
   try {
     var origin = new URL(env.ORIGIN);
     var r = await fetch(new Request(new URL(url.pathname + url.search, origin).toString(), { method: "GET", headers: request.headers }), { redirect: "manual" });
-    if (r.status === 200) await store(key, r, ttl);
+    if (r.status === 200) await store(key, r, ttl, kind);
     else if (r.status === 401 || r.status === 403 || r.status === 404) await caches.default.delete(key);
   } catch (e) {}
 }
@@ -276,20 +289,27 @@ async function refresh(request, env, url, key, ttl) {
 async function edgeLookup(request, env, ctx, url, cp, kind) {
   var out = { res: null, fill: null };
   try {
+    var isPublicKind = (kind === "cover" || kind === "asset" || kind === "html");
     var cred = credential(request, url);
-    if (!cred && kind !== "cover") return out;
+    if (!cred && !isPublicKind) return out;
     var ch = cred ? await sha16(cred) : "";
     var cache = caches.default, base = url.origin + "/__edge/";
     var user = cred ? (userOf(cred) || ch) : "anon";
-    var keyStr = (kind === "cover" ? "c|" : "j|" + user + "|") + cp + "|" + normQuery(url);
+    var prefix = kind === "cover" ? "c|" : (kind === "asset" ? "a|" : (kind === "html" ? "h|" + url.pathname + "|" : "j|" + user + "|"));
+    // Note: for HTML shell, key by actual url.pathname (since base path / vs /audiobookshelf/ affects asset links in HTML)
+    var keyStr = (kind === "html" ? prefix + normQuery(url) : prefix + cp + "|" + normQuery(url));
     var key = base + "d/" + (await sha16(keyStr));
-    var fresh = kind === "cover" ? num(env.COVER_TTL_S, 2592000) : num(env.JSON_FRESH_S, 120);
-    var swr = kind === "cover" ? 0 : num(env.JSON_SWR_S, 3600);
-    out.fill = { key: key, ttl: fresh + swr + 60 };
+    var fresh = (kind === "cover" || kind === "asset")
+      ? num(env.COVER_TTL_S, 2592000)
+      : (kind === "html" ? num(env.HTML_FRESH_S, 300) : num(env.JSON_FRESH_S, 120));
+    var swr = (kind === "cover" || kind === "asset")
+      ? 0
+      : (kind === "html" ? num(env.HTML_SWR_S, 86400) : num(env.JSON_SWR_S, 3600));
+    out.fill = { key: key, ttl: fresh + swr + 60, kind: kind };
     var parts = await Promise.all([
-      cred ? cache.match(base + "v/" + ch) : Promise.resolve(true),
+      (cred && !isPublicKind) ? cache.match(base + "v/" + ch) : Promise.resolve(true),
       cache.match(key),
-      getEpoch(env, cache, base)
+      kind === "asset" ? Promise.resolve(0) : getEpoch(env, cache, base)
     ]);
     var valid = parts[0], hit = parts[1], epoch = parts[2];
     if (valid && hit) {
@@ -298,7 +318,7 @@ async function edgeLookup(request, env, ctx, url, cp, kind) {
         var age = (Date.now() - at) / 1000;
         if (age <= fresh) { out.res = tag(hit, "HIT"); return out; }
         if (age <= fresh + swr) {
-          ctx.waitUntil(refresh(request, env, url, key, out.fill.ttl));
+          ctx.waitUntil(refresh(request, env, url, key, out.fill.ttl, kind));
           out.res = tag(hit, "STALE");
           return out;
         }
@@ -420,9 +440,6 @@ async function enqueueTrackJob(env, job) {
   } catch (e) {}
 }
 
-// Records a mapping of a book's inodes and filenames to track keys (itemmap:<itemId>)
-// so offline downloads (/api/items/:id/file/:ino or /s/item/:id/:file) can be served from R2
-// if and ONLY if the book is already cached in R2.
 async function saveItemFileMap(env, itemId, tracksArr, libraryFilesArr) {
   try {
     if (!env.KV || !itemId || !Array.isArray(tracksArr) || !tracksArr.length) return null;
@@ -581,7 +598,6 @@ async function serveFromCache(request, env, ctx, sid, n) {
     if (!t) return { hit: null, bypassed: false };
     var resp = await buildR2TrackResponse(request, env, ctx, t, false);
     if (!resp) {
-      // Only active streaming sessions (/public/session/:sid/track/:n) trigger background R2 warming
       ctx.waitUntil(enqueueTrackJob(env, { sid: sid, item: sess.item, n: String(n), key: t.key, size: t.size || 0, mime: t.mime || "" }));
       return { hit: null, bypassed: false };
     }
@@ -589,8 +605,6 @@ async function serveFromCache(request, env, ctx, sid, n) {
   } catch (e) { return { hit: null, bypassed: false }; }
 }
 
-// Serves offline book downloads (/api/items/:id/file/:ino[/download] or /s/item/:id/:file) from R2
-// ONLY if the track is ALREADY cached in R2. Never queues or stores uncached books on download.
 async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, ino, filename, isExplicitDownload) {
   try {
     var r2State = await getR2State(env, false);
@@ -601,10 +615,9 @@ async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, i
     var mapObj = rawMap ? JSON.parse(rawMap) : null;
 
     if (!mapObj || (ino && (!mapObj.byIno || !mapObj.byIno[ino])) || (filename && (!mapObj.byFile || !mapObj.byFile[filename]))) {
-      // Check if track-1 of this book is even in R2 before fetching item metadata
       ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
       var hasTrack1 = await env.CACHE.head(itemId + "/track-1");
-      if (!hasTrack1) return null; // Book is not in R2; pass straight to ORIGIN without caching!
+      if (!hasTrack1) return null;
 
       var origin = new URL(env.ORIGIN);
       var h = new Headers();
@@ -627,7 +640,6 @@ async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, i
     else if (mapObj.count === 1) t = { key: itemId + "/track-1", mime: "", filename: filename || "" };
     if (!t) return null;
 
-    // Read-only R2 lookup: if present, serve from R2; if missing, return null (never enqueue warming)
     return await buildR2TrackResponse(request, env, ctx, t, isExplicitDownload);
   } catch (e) { return null; }
 }
@@ -687,7 +699,7 @@ export default {
 
     var lookup = null;
     if (request.method === "GET" && env.EDGE_CACHE !== "off" && !request.headers.has("range")) {
-      var kind = classify(cp, url.search);
+      var kind = classify(cp, url.search, request);
       if (kind) {
         lookup = await edgeLookup(request, env, ctx, url, cp, kind);
         if (lookup.res) { ctx.waitUntil(record(env, request, lookup.res, url, cp)); return lookup.res; }
@@ -726,8 +738,16 @@ export default {
     }
     var filled = false;
     if (lookup && lookup.fill && resp.status === 200) {
-      ctx.waitUntil(store(lookup.fill.key, resp.clone(), lookup.fill.ttl));
-      filled = true;
+      if (lookup.fill.kind === "html") {
+        var ct = (resp.headers.get("content-type") || "").toLowerCase();
+        if (ct.indexOf("text/html") !== -1 || ct.indexOf("javascript") !== -1) {
+          ctx.waitUntil(store(lookup.fill.key, resp.clone(), lookup.fill.ttl, lookup.fill.kind));
+          filled = true;
+        }
+      } else {
+        ctx.waitUntil(store(lookup.fill.key, resp.clone(), lookup.fill.ttl, lookup.fill.kind));
+        filled = true;
+      }
     }
 
     if (resp.status === 101) { ctx.waitUntil(record(env, request, resp, url, cp)); return resp; }

@@ -101,6 +101,8 @@ Cloudflare's standard CDN cache (`caches.default`) is great for small cover imag
 If `GET /api/me/progress`, `GET /api/libraries/:id/personalized`, or `GET /api/items/:id?include=progress` returned a cached response that was even 60 seconds old, reopening the app on another device could overwrite your resume position and jump backward in your book.
 * **Rule:** Any endpoint or query carrying user progress (`progress`, `rssfeed`, `/api/me/*`, `/api/libraries/:id/personalized`, `/api/session/*`) always goes straight to your origin server.
 * **What *is* cached at the edge:**
+  * **Web UI Static Bundles (`/_nuxt/*`, `.js`, `.css`, `.woff2`, `.svg`, `.ico`, `.webmanifest`):** Content-hashed Nuxt JS/CSS bundles, fonts, and icons are cached at Cloudflare's edge for **30 days** (`COVER_TTL_S`).
+  * **Web UI SPA HTML Shell (`/`, `/login`, `/library/*`, etc., plus `/sw.js`):** Cached at Cloudflare's edge with a **5-minute fresh window** (`HTML_FRESH_S = 300`) and a **24-hour Stale-While-Revalidate window** (`HTML_SWR_S = 86400`) so the Web UI loads instantaneously while still picking up Audiobookshelf server updates automatically.
   * **Covers & Author Images (`/api/items/:id/cover`, `/api/authors/:id/image`):** Cached for **30 days** (`COVER_TTL_S`), keyed by query parameters (`width`, `format`, `raw`, `ts`).
   * **Static Library & Metadata Lists (`/api/libraries`, `/api/libraries/:id/items`, `/series`, `/authors`, `/collections`, `/filterdata`, `/stats`):** Cached per user with a **2-minute fresh window** (`JSON_FRESH_S = 120`) and a **1-hour Stale-While-Revalidate window** (`JSON_SWR_S = 3600`). After 2 minutes, the cached list is returned instantly (`0 ms` origin wait) while the Worker refreshes it in the background.
 

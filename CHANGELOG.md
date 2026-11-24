@@ -7,6 +7,9 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Web UI Static Asset & HTML Shell Edge Caching (`/_nuxt/*`, `.js`, `.css`, fonts, icons, SPA HTML):**
+  - Cached content-hashed Nuxt JS/CSS bundles (`/_nuxt/*`), fonts, and icons at Cloudflare's edge for 30 days.
+  - Cached the Nuxt SPA HTML shell (`/`, `/login`, `/library/*`, etc.) and `/sw.js` with a 5-minute fresh window (`HTML_FRESH_S = 300`) and 24-hour stale-while-revalidate window (`HTML_SWR_S = 86400`).
 - **Read-Only R2 Acceleration for Local Book Downloads (`/api/items/:id/file/:ino` & `/s/item/:id/:file`):**
   - When a user presses the **Download** button in the mobile app or Web UI, the Worker checks if the book is already cached in R2:
     - If **already in R2** (`HIT`), the download is served directly from Cloudflare R2 at edge speed (after verifying the user's auth token).
