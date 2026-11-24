@@ -4,6 +4,23 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 
 ---
 
+## [1.0.1] - 2026-11-24
+
+### Security
+- **Cached Download Permission Verification:** `serveDownloadFromCacheIfPresent()` now checks access at `ORIGIN` (`Range: bytes=0-0`, cached 60s per credential + path) before serving cached R2 files, enforcing `canDownload` and library restrictions.
+- **Fail-Closed `VERIFY_JWT` Configuration:** When `VERIFY_JWT="yes"` is set without `JWT_SECRET`, the Worker now logs an error and returns `500` instead of silently disabling JWT verification.
+- **Revoked/Deleted User Enforcement with `VERIFY_JWT="yes"`:** `isCredentialValid()` now requires recent origin confirmation (`/__edge/v/<hash>` or `/api/me` fallback when `ORIGIN` is online), catching deleted or disabled users within the 15-minute cache window.
+- **Opt-In Probe Logging (`PROBE_LOG`):** `record()` now skips KV diagnostic logging unless `PROBE_LOG="yes"` is explicitly configured.
+- **IPv6 `/64` Expansion & Persistent Login Rate Limiting:** `normalizeClientIp()` now expands compressed `::` IPv6 addresses into 8 groups before taking the `/64` prefix, and successful logins no longer clear `loginfail:<ip>` counters.
+- **Pre-Clone Security & Memory Hardening:** Scanner blocking (`BLOCK_DOT`/`BLOCK_PATH`/`BLOCK_EXT`), `VERIFY_JWT` secret check, and `POST /login` rate limiting now run before `request.clone()`; `POST /login` and `POST /api/login` never fail-open; and `request.clone()` is skipped for bodies larger than `1 MiB`.
+
+### Fixed
+- **RSS Warm-on-Origin-Success:** `/feed/:slug/*` now enqueues `rss-track` warming jobs only after `ORIGIN` returns `200` or `206` (preventing 401/404 cache-warming spam).
+- **Stale R2 Object Size Check:** `buildR2TrackResponse()` treats cached R2 objects as a miss if their byte size differs from the session/item manifest (`t.size > 0 && obj.size !== t.size`).
+- **Non-ASCII `Content-Disposition` & URI Guard:** Download responses now emit RFC 5987 `filename*=UTF-8''...` alongside an ASCII fallback, and malformed percent-encoding on `/s/item/:id/:file` returns `400 Bad Request`.
+
+---
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
