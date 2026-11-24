@@ -1033,8 +1033,7 @@ async function queueOfflineProgressWrite(env, request, url, cp, bodyText) {
   } catch (e) { return false; }
 }
 
-export default {
-  async fetch(request, env, ctx) {
+async function handleFetch(request, env, ctx) {
     var url = new URL(request.url);
     var p = url.pathname;
     if (BLOCK_DOT.test(p) || BLOCK_PATH.test(p) || BLOCK_EXT.test(p)) {
@@ -1248,6 +1247,25 @@ export default {
     applySecurityHeaders(out.headers);
     ctx.waitUntil(record(env, request, out, url, cp));
     return out;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    var failOpenReq = request.clone();
+    try {
+      return await handleFetch(request, env, ctx);
+    } catch (e) {
+      try {
+        var url = new URL(failOpenReq.url);
+        var origin = new URL(env.ORIGIN);
+        var resp = await fetch(new Request(new URL(url.pathname + url.search, origin).toString(), failOpenReq), { redirect: "manual" });
+        var out = new Response(resp.body, resp);
+        out.headers.set("x-abs-cache", "FAIL-OPEN");
+        return out;
+      } catch (e2) {
+        return new Response("Origin unreachable", { status: 502 });
+      }
+    }
   },
 
   async queue(batch, env) {

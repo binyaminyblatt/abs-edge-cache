@@ -458,3 +458,26 @@ test("RSS feed XML and audio enclosures are cached at edge and in R2", async () 
   assert.equal(aud2.headers.get("x-abs-cache"), "HIT");
   assert.equal(await aud2.text(), "RSS");
 });
+
+test("top-level fetch fails open to origin on unexpected internal error", async () => {
+  installGlobals(async () => new Response("origin-ok", { status: 200 }));
+  const env = makeEnv();
+  const ctx = makeCtx();
+  const origReq = new Request("https://edge.example.com/api/ping");
+  let threw = false;
+  const proxyReq = new Proxy(origReq, {
+    get(target, prop) {
+      if (prop === "headers" && !threw) {
+        threw = true;
+        throw new Error("simulated unexpected worker bug");
+      }
+      const val = Reflect.get(target, prop);
+      return typeof val === "function" ? val.bind(target) : val;
+    }
+  });
+  proxyReq.clone = () => origReq;
+  const res = await worker.fetch(proxyReq, env, ctx);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("x-abs-cache"), "FAIL-OPEN");
+  assert.equal(await res.text(), "origin-ok");
+});
