@@ -7,6 +7,11 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Security Hardening & Fail-Open Wrapper:**
+  - Added top-level fail-open `try/catch` around `fetch()` (`x-abs-cache: FAIL-OPEN`) with `applySecurityHeaders()`.
+  - Enforced `isCredentialValid()` in `queueOfflineProgressWrite()` so unauthenticated/forged tokens cannot enqueue offline progress jobs even when `VERIFY_JWT="no"`.
+  - Upgraded `sha16()` token/cache hashes from 64-bit to 128-bit (`slice(0, 16)`), and added IPv6 `/64` prefix normalization to the brute-force login rate limiter (`MAX_LOGIN_ATTEMPTS`).
+  - Added a strong recommendation in `README.md` to enable `VERIFY_JWT="yes"` + `JWT_SECRET` for production deployments.
 - **Audio Streaming & Scrubbing Benchmark Script (`scripts/benchmark.mjs`):**
   - Added `npm run benchmark` (`ABS_EDGE_URL`, `ABS_ORIGIN_URL`, `ABS_TOKEN`, optional `ABS_ITEM_ID`) to measure Origin vs. Edge (R2 `HIT`) play-start TTFB, random `64 KB` scrubbing/seeking latency, and `10 MB` streaming throughput, then close the temporary session cleanly.
 - **Offline-Origin Resilience (`STALE-IF-ERROR` & Queued Progress Writes):**

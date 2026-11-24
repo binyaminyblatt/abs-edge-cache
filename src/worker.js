@@ -235,9 +235,17 @@ async function record(env, request, resp, url, cp) {
 
 // ---------- Edge Brute-Force Login Rate Limiter ----------
 
+function normalizeClientIp(ip) {
+  if (!ip || ip === "unknown") return "unknown";
+  if (ip.indexOf(":") !== -1) {
+    return ip.split(":").slice(0, 4).join(":") + "::/64";
+  }
+  return ip;
+}
+
 async function checkLoginRateLimit(env, request, url) {
   try {
-    var ip = request.headers.get("cf-connecting-ip") || "unknown";
+    var ip = normalizeClientIp(request.headers.get("cf-connecting-ip") || "unknown");
     var maxAttempts = num(env.MAX_LOGIN_ATTEMPTS, 5);
     if (maxAttempts <= 0) return { blocked: false, ip: ip };
     var cacheKey = url.origin + "/__edge/loginfail/" + ip;
@@ -276,7 +284,7 @@ async function recordLoginResult(env, url, ip, success) {
 
 async function sha16(s) {
   var d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(d)).slice(0, 8).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+  return Array.from(new Uint8Array(d)).slice(0, 16).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
 }
 
 function b64UrlToBytes(b64url) {
@@ -1010,12 +1018,7 @@ async function serveRssAudioFromCache(request, env, ctx, cp, slug, restPath) {
 async function queueOfflineProgressWrite(env, request, url, cp, bodyText) {
   try {
     if (!env.WARM) return false;
-    var cred = credential(request, url);
-    if (!cred) return false;
-    if (isJwtVerifyEnabled(env)) {
-      var v = await verifyJwtToken(env, cred);
-      if (!v.valid) return false;
-    }
+    if (!(await isCredentialValid(env, request, url))) return false;
     var fwdHeaders = {};
     if (request.headers.get("authorization")) fwdHeaders["authorization"] = request.headers.get("authorization");
     if (request.headers.get("cookie")) fwdHeaders["cookie"] = request.headers.get("cookie");
@@ -1261,6 +1264,7 @@ export default {
         var resp = await fetch(new Request(new URL(url.pathname + url.search, origin).toString(), failOpenReq), { redirect: "manual" });
         var out = new Response(resp.body, resp);
         out.headers.set("x-abs-cache", "FAIL-OPEN");
+        applySecurityHeaders(out.headers);
         return out;
       } catch (e2) {
         return new Response("Origin unreachable", { status: 502 });

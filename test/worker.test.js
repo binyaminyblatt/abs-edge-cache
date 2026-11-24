@@ -287,6 +287,20 @@ test("MAX_LOGIN_ATTEMPTS rate-limits repeated failed logins with 429", async () 
     headers: { "cf-connecting-ip": "1.2.3.4" }
   }), env, ctx);
   assert.equal(blocked.status, 429);
+
+  // IPv6 /64 prefix normalization: 2 failed attempts from ::1 block ::2 in same /64
+  for (let i = 0; i < 2; i++) {
+    await worker.fetch(new Request("https://edge.example.com/login", {
+      method: "POST",
+      headers: { "cf-connecting-ip": "2001:db8:1234:5678::1" }
+    }), env, ctx);
+    await ctx.flush();
+  }
+  const v6Blocked = await worker.fetch(new Request("https://edge.example.com/login", {
+    method: "POST",
+    headers: { "cf-connecting-ip": "2001:db8:1234:5678::9999" }
+  }), env, ctx);
+  assert.equal(v6Blocked.status, 429);
 });
 
 test("VERIFY_JWT rejects forged tokens and accepts valid HS256 JWTs", async () => {
@@ -372,13 +386,24 @@ test("offline progress writes are queued and replayed when origin recovers, whil
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   });
 
-  const env = makeEnv();
+  const secret = "offline-test-secret";
+  const env = makeEnv({ VERIFY_JWT: "yes", JWT_SECRET: secret });
   const ctx = makeCtx();
+  const validJwt = await signJwt({ userId: "u1", exp: Math.floor(Date.now() / 1000) + 3600 }, secret);
 
-  // Progress sync while origin is down -> queued & 200 OK
+  // Forged token while origin is down -> NOT queued, passes through 503
+  const badSyncRes = await worker.fetch(new Request("https://edge.example.com/api/session/s1/sync", {
+    method: "POST",
+    headers: { authorization: "Bearer forged.tok.here", "content-type": "application/json" },
+    body: JSON.stringify({ currentTime: 999 })
+  }), env, ctx);
+  assert.equal(badSyncRes.status, 503);
+  assert.equal(env.WARM.sent.length, 0);
+
+  // Valid JWT progress sync while origin is down -> queued & 200 OK
   const syncRes = await worker.fetch(new Request("https://edge.example.com/api/session/s1/sync", {
     method: "POST",
-    headers: { authorization: "Bearer tok", "content-type": "application/json" },
+    headers: { authorization: `Bearer ${validJwt}`, "content-type": "application/json" },
     body: JSON.stringify({ currentTime: 420 })
   }), env, ctx);
   assert.equal(syncRes.status, 200);
