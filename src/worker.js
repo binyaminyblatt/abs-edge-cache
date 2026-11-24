@@ -1,7 +1,9 @@
 // abs-edge-cache: Cloudflare Worker front door for Audiobookshelf
 // - blocks scanner/bot paths, proxies everything else to ORIGIN (supports root and /audiobookshelf base path)
 // - edge-caches covers and static metadata (invalidated on edits seen by this Worker)
-// - learns playback sessions, serves cached audio from R2, warms cache via Queue
+// - learns playback sessions, serves cached audio from R2, warms cache via Queue ONLY on active playback
+// - accelerates offline book downloads (/api/items/:id/file/:ino, /s/item/:id/:file) from R2 if ALREADY cached,
+//   without warming/storing downloaded books into R2 on a miss
 // - optional Free-Tier R2 Circuit Breaker (FREE_TIER_GUARD = "yes" by default; set to "no" for unlimited paid R2)
 
 const ID_RE = /^(li|ses|usr|lib|ser|aut|col|pl|ep|fol|dev)_[a-z0-9]+$/i;
@@ -13,9 +15,6 @@ const BLOCK_EXT = /\.(php\d?|aspx?|jsp|cgi|sql|bak|ini|ya?ml|conf|env|git|log|sw
 const APP_PATH = /^\/(api|public|s|hls|socket\.io|login|logout|status|ping|auth|feed)(\/|$)/;
 const NOBUMP = /^\/api\/(session|me|authorize|items\/[^/]+\/play)(\/|$)/;
 
-// Cloudflare R2 Free Tier is 10 GB storage, 1,000,000 Class A ops/mo, 10,000,000 Class B ops/mo.
-// When FREE_TIER_GUARD is enabled (default "yes"), we cap at 9.0 GB storage, 800k Class A, and 8M Class B.
-// Set FREE_TIER_GUARD="no" (or "false" / "off" / "0") to disable all R2 kill switches for paid R2 plans.
 const DEFAULT_MAX_BUCKET_BYTES = 9000000000;
 const DEFAULT_MAX_CLASS_A = 800000;
 const DEFAULT_MAX_CLASS_B = 8000000;
@@ -38,7 +37,7 @@ function monthKey() {
 
 function getLimits(env) {
   var guard = isFreeTierGuardEnabled(env);
-  var maxBytes = guard ? DEFAULT_MAX_BUCKET_BYTES : 0; // 0 = unlimited unless explicitly set
+  var maxBytes = guard ? DEFAULT_MAX_BUCKET_BYTES : 0;
   if (env.MAX_BUCKET_BYTES && guard) maxBytes = num(env.MAX_BUCKET_BYTES, DEFAULT_MAX_BUCKET_BYTES);
   else if (env.MAX_BUCKET_MB && guard) maxBytes = num(env.MAX_BUCKET_MB, 9000) * 1000000;
   return {
@@ -258,6 +257,13 @@ async function markValid(request, url) {
   } catch (e) {}
 }
 
+async function isCredentialValid(request, url) {
+  var cred = credential(request, url);
+  if (!cred) return false;
+  var k = url.origin + "/__edge/v/" + (await sha16(cred));
+  return Boolean(await caches.default.match(k));
+}
+
 async function refresh(request, env, url, key, ttl) {
   try {
     var origin = new URL(env.ORIGIN);
@@ -352,7 +358,6 @@ async function checkProgressEviction(env, request, cp) {
   } catch (e) {}
 }
 
-// Ensures writing neededBytes will NEVER allow the R2 bucket to exceed maxBytes when FREE_TIER_GUARD is enabled.
 async function ensureCapacityFromSnapshot(env, objs, neededBytes, activeItem) {
   var lim = getLimits(env);
   if (!lim.guardEnabled || lim.maxBytes <= 0) {
@@ -415,6 +420,51 @@ async function enqueueTrackJob(env, job) {
   } catch (e) {}
 }
 
+// Records a mapping of a book's inodes and filenames to track keys (itemmap:<itemId>)
+// so offline downloads (/api/items/:id/file/:ino or /s/item/:id/:file) can be served from R2
+// if and ONLY if the book is already cached in R2.
+async function saveItemFileMap(env, itemId, tracksArr, libraryFilesArr) {
+  try {
+    if (!env.KV || !itemId || !Array.isArray(tracksArr) || !tracksArr.length) return null;
+    var inoToIndex = {};
+    if (Array.isArray(libraryFilesArr)) {
+      for (var lf of libraryFilesArr) {
+        if (lf && lf.ino && lf.metadata && lf.metadata.filename) {
+          inoToIndex[lf.metadata.filename] = String(lf.ino);
+        }
+      }
+    }
+    var byIno = {}, byFile = {};
+    for (var i = 0; i < tracksArr.length; i++) {
+      var t = tracksArr[i];
+      var mm = /\/track\/(\d+)/.exec(t.contentUrl || "");
+      var n = mm ? mm[1] : String(t.index != null ? t.index : (i + 1));
+      var key = itemId + "/track-" + n;
+      var mime = t.mimeType || "";
+      var fname = (t.metadata && t.metadata.filename) || "";
+      if (!fname && t.contentUrl) {
+        var parts = t.contentUrl.split("/");
+        fname = decodeURIComponent(parts[parts.length - 1] || "");
+      }
+      var ino = t.ino ? String(t.ino) : (fname && inoToIndex[fname] ? inoToIndex[fname] : "");
+      var entry = { key: key, mime: mime, filename: fname };
+      if (ino) byIno[ino] = entry;
+      if (fname) byFile[fname] = entry;
+    }
+    var mapObj = { byIno: byIno, byFile: byFile, count: tracksArr.length };
+    await env.KV.put("itemmap:" + itemId, JSON.stringify(mapObj), { expirationTtl: 604800 });
+    return mapObj;
+  } catch (e) { return null; }
+}
+
+async function learnItemDetails(env, resp) {
+  try {
+    var data = await resp.json();
+    if (!data || !data.id || !data.media || !Array.isArray(data.media.tracks)) return;
+    await saveItemFileMap(env, data.id, data.media.tracks, data.libraryFiles);
+  } catch (e) {}
+}
+
 async function learnSessionData(env, s) {
   try {
     var sid = s && s.id, item = s && s.libraryItemId;
@@ -431,6 +481,7 @@ async function learnSessionData(env, s) {
       jobs.push({ sid: sid, item: item, n: n, key: key, size: size, mime: mime });
     }
     await env.KV.put("sess:" + sid, JSON.stringify({ item: item, tracks: tracks }), { expirationTtl: 172800 });
+    await saveItemFileMap(env, item, s.audioTracks, s.libraryItem && s.libraryItem.libraryFiles);
     if (env.CACHE && env.WARM) {
       var r2State = await getR2State(env, false);
       if (r2State.tripped) return;
@@ -475,6 +526,50 @@ async function ensureSessionLearned(env, request, sid) {
   } catch (e) {}
 }
 
+async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
+  if (request.method === "HEAD") {
+    ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
+    var h = await env.CACHE.head(t.key);
+    if (!h) return null;
+    var hh = new Headers();
+    h.writeHttpMetadata(hh);
+    hh.set("content-length", String(h.size));
+    hh.set("accept-ranges", "bytes");
+    hh.set("etag", h.httpEtag);
+    hh.set("x-abs-cache", "HIT");
+    if (t.mime) hh.set("content-type", t.mime);
+    if (isDownload && t.filename) {
+      hh.set("content-disposition", 'attachment; filename="' + t.filename.replace(/"/g, "") + '"');
+    }
+    return new Response(null, { status: 200, headers: hh });
+  }
+  var rangeHdr = request.headers.get("range");
+  ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
+  var obj = await env.CACHE.get(t.key, rangeHdr ? { range: request.headers } : {});
+  if (!obj) return null;
+  var headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set("etag", obj.httpEtag);
+  headers.set("accept-ranges", "bytes");
+  headers.set("x-abs-cache", "HIT");
+  if (t.mime) headers.set("content-type", t.mime);
+  if (isDownload && t.filename) {
+    headers.set("content-disposition", 'attachment; filename="' + t.filename.replace(/"/g, "") + '"');
+  }
+  var status = 200;
+  if (rangeHdr && obj.range) {
+    var r = obj.range, off, len;
+    if (r.suffix !== undefined) { len = Math.min(r.suffix, obj.size); off = obj.size - len; }
+    else { off = r.offset || 0; len = r.length !== undefined ? r.length : obj.size - off; }
+    headers.set("content-range", "bytes " + off + "-" + (off + len - 1) + "/" + obj.size);
+    headers.set("content-length", String(len));
+    status = 206;
+  } else {
+    headers.set("content-length", String(obj.size));
+  }
+  return new Response(obj.body, { status: status, headers: headers });
+}
+
 async function serveFromCache(request, env, ctx, sid, n) {
   try {
     var r2State = await getR2State(env, false);
@@ -484,48 +579,57 @@ async function serveFromCache(request, env, ctx, sid, n) {
     var sess = JSON.parse(raw);
     var t = (sess.tracks && sess.tracks[n]) || (sess.item ? { key: sess.item + "/track-" + n, size: 0, mime: "" } : null);
     if (!t) return { hit: null, bypassed: false };
-    if (request.method === "HEAD") {
-      ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
-      var h = await env.CACHE.head(t.key);
-      if (!h) {
-        ctx.waitUntil(enqueueTrackJob(env, { sid: sid, item: sess.item, n: String(n), key: t.key, size: t.size || 0, mime: t.mime || "" }));
-        return { hit: null, bypassed: false };
-      }
-      var hh = new Headers();
-      h.writeHttpMetadata(hh);
-      hh.set("content-length", String(h.size));
-      hh.set("accept-ranges", "bytes");
-      hh.set("etag", h.httpEtag);
-      hh.set("x-abs-cache", "HIT");
-      if (t.mime) hh.set("content-type", t.mime);
-      return { hit: new Response(null, { status: 200, headers: hh }), bypassed: false };
-    }
-    var rangeHdr = request.headers.get("range");
-    ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
-    var obj = await env.CACHE.get(t.key, rangeHdr ? { range: request.headers } : {});
-    if (!obj) {
+    var resp = await buildR2TrackResponse(request, env, ctx, t, false);
+    if (!resp) {
+      // Only active streaming sessions (/public/session/:sid/track/:n) trigger background R2 warming
       ctx.waitUntil(enqueueTrackJob(env, { sid: sid, item: sess.item, n: String(n), key: t.key, size: t.size || 0, mime: t.mime || "" }));
       return { hit: null, bypassed: false };
     }
-    var headers = new Headers();
-    obj.writeHttpMetadata(headers);
-    headers.set("etag", obj.httpEtag);
-    headers.set("accept-ranges", "bytes");
-    headers.set("x-abs-cache", "HIT");
-    if (t.mime) headers.set("content-type", t.mime);
-    var status = 200;
-    if (rangeHdr && obj.range) {
-      var r = obj.range, off, len;
-      if (r.suffix !== undefined) { len = Math.min(r.suffix, obj.size); off = obj.size - len; }
-      else { off = r.offset || 0; len = r.length !== undefined ? r.length : obj.size - off; }
-      headers.set("content-range", "bytes " + off + "-" + (off + len - 1) + "/" + obj.size);
-      headers.set("content-length", String(len));
-      status = 206;
-    } else {
-      headers.set("content-length", String(obj.size));
-    }
-    return { hit: new Response(obj.body, { status: status, headers: headers }), bypassed: false };
+    return { hit: resp, bypassed: false };
   } catch (e) { return { hit: null, bypassed: false }; }
+}
+
+// Serves offline book downloads (/api/items/:id/file/:ino[/download] or /s/item/:id/:file) from R2
+// ONLY if the track is ALREADY cached in R2. Never queues or stores uncached books on download.
+async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, ino, filename, isExplicitDownload) {
+  try {
+    var r2State = await getR2State(env, false);
+    if (r2State.tripped) return null;
+    if (!(await isCredentialValid(request, url))) return null;
+
+    var rawMap = await env.KV.get("itemmap:" + itemId);
+    var mapObj = rawMap ? JSON.parse(rawMap) : null;
+
+    if (!mapObj || (ino && (!mapObj.byIno || !mapObj.byIno[ino])) || (filename && (!mapObj.byFile || !mapObj.byFile[filename]))) {
+      // Check if track-1 of this book is even in R2 before fetching item metadata
+      ctx.waitUntil(recordR2Ops(env, 0, 1, undefined, false));
+      var hasTrack1 = await env.CACHE.head(itemId + "/track-1");
+      if (!hasTrack1) return null; // Book is not in R2; pass straight to ORIGIN without caching!
+
+      var origin = new URL(env.ORIGIN);
+      var h = new Headers();
+      var cred = credential(request, url);
+      if (cred) h.set("authorization", "Bearer " + cred);
+      if (request.headers.get("cookie")) h.set("cookie", request.headers.get("cookie"));
+      var r = await fetch(new URL("/api/items/" + itemId, origin).toString(), { method: "GET", headers: h });
+      if (r.ok) {
+        var itemData = await r.json();
+        if (itemData && itemData.media && Array.isArray(itemData.media.tracks)) {
+          mapObj = await saveItemFileMap(env, itemId, itemData.media.tracks, itemData.libraryFiles);
+        }
+      }
+    }
+
+    if (!mapObj) return null;
+    var t = null;
+    if (ino && mapObj.byIno && mapObj.byIno[ino]) t = mapObj.byIno[ino];
+    else if (filename && mapObj.byFile && mapObj.byFile[filename]) t = mapObj.byFile[filename];
+    else if (mapObj.count === 1) t = { key: itemId + "/track-1", mime: "", filename: filename || "" };
+    if (!t) return null;
+
+    // Read-only R2 lookup: if present, serve from R2; if missing, return null (never enqueue warming)
+    return await buildR2TrackResponse(request, env, ctx, t, isExplicitDownload);
+  } catch (e) { return null; }
 }
 
 export default {
@@ -539,9 +643,7 @@ export default {
     var origin = new URL(env.ORIGIN);
 
     if (cp === "/__abs-cache/status" && request.method === "GET") {
-      var cred = credential(request, url);
-      var valid = cred ? await caches.default.match(url.origin + "/__edge/v/" + (await sha16(cred))) : null;
-      if (!valid) return new Response("Unauthorized", { status: 401 });
+      if (!(await isCredentialValid(request, url))) return new Response("Unauthorized", { status: 401 });
       var st = await getR2State(env, true);
       var lim = getLimits(env);
       return new Response(JSON.stringify({
@@ -561,12 +663,26 @@ export default {
       }, null, 2), { status: 200, headers: { "content-type": "application/json" } });
     }
 
+    // 1. Active session audio streaming (/public/session/:sid/track/:n): serves from R2 and warms on miss
     var m = cp.match(/^\/public\/session\/([^/]+)\/track\/(\d+)$/);
     var r2Bypassed = false;
     if (m && env.CACHE && env.KV && (request.method === "GET" || request.method === "HEAD")) {
       var res = await serveFromCache(request, env, ctx, m[1], m[2]);
       if (res.hit) { ctx.waitUntil(record(env, request, res.hit, url, cp)); return res.hit; }
       r2Bypassed = res.bypassed;
+    }
+
+    // 2. Direct file / offline download requests (/api/items/:id/file/:ino[/download] or /s/item/:id/:file):
+    //    Serves from R2 if ALREADY cached, but NEVER stores/warms into R2 on a miss!
+    var dlIno = cp.match(/^\/api\/items\/([^/]+)\/file\/([^/]+)(\/download)?$/);
+    var dlFile = !dlIno ? cp.match(/^\/s\/item\/([^/]+)\/(.+)$/) : null;
+    if ((dlIno || dlFile) && env.CACHE && env.KV && (request.method === "GET" || request.method === "HEAD")) {
+      var dlItemId = dlIno ? dlIno[1] : dlFile[1];
+      var ino = dlIno ? dlIno[2] : "";
+      var fname = dlFile ? decodeURIComponent(dlFile[2]) : "";
+      var isExplicitDl = Boolean(dlIno && dlIno[3]);
+      var dlHit = await serveDownloadFromCacheIfPresent(request, env, ctx, url, dlItemId, ino, fname, isExplicitDl);
+      if (dlHit) { ctx.waitUntil(record(env, request, dlHit, url, cp)); return dlHit; }
     }
 
     var lookup = null;
@@ -598,6 +714,9 @@ export default {
     if (request.method === "POST" && env.KV && resp.ok && /^\/api\/items\/[^/]+\/play(\/[^/]+)?$/.test(cp)) {
       ctx.waitUntil(learnSession(env, resp.clone()));
     }
+    if (request.method === "GET" && env.KV && resp.status === 200 && /^\/api\/items\/[^/]+$/.test(cp)) {
+      ctx.waitUntil(learnItemDetails(env, resp.clone()));
+    }
     if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS"
         && cp.indexOf("/api/") === 0 && resp.status < 400 && !NOBUMP.test(cp)) {
       ctx.waitUntil(bumpEpoch(env, url.origin + "/__edge/"));
@@ -623,6 +742,7 @@ export default {
     out.headers.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
     if (r2Bypassed) out.headers.set("x-abs-cache", "BYPASS-LIMIT");
     else if (m || filled) out.headers.set("x-abs-cache", "MISS");
+    else if (dlIno || dlFile) out.headers.set("x-abs-cache", "MISS-NO-STORE");
     ctx.waitUntil(record(env, request, out, url, cp));
     return out;
   },

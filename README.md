@@ -111,6 +111,9 @@ What if you edit a book's title, match metadata, or upload a new cover? You don'
 
 ### How Authentication & Security Work at the Edge
 * **Audio Tracks (`/public/session/:sid/track/:n`):** Audiobookshelf's native players do not send an `Authorization` header on `<audio>` / `AppleCoreMedia` range requests; the capability URL's random session UUID (`:sid`) is the credential. The Worker only serves an audio track from R2 if `:sid` matches an active session previously opened via an authenticated `POST /api/items/:id/play` (or `/api/session/:sid/sync`) call on your origin server.
+* **Offline Book Downloads (`/api/items/:id/file/:ino[/download]` & `/s/item/:id/:file`):** When you push the **Download** button in the mobile app or Web UI to save a book locally to your phone/tablet:
+  * **If the book is ALREADY cached in R2** (because you were streaming it earlier), the Worker verifies your auth token, maps the file inode/filename to the cached R2 track (`itemmap:<itemId>`), and serves the download **straight from Cloudflare R2 at maximum edge speed** (`x-abs-cache: HIT`).
+  * **If the book is NOT in R2**, the Worker streams the download directly from your `ORIGIN` server (`x-abs-cache: MISS-NO-STORE`) and **never queues or stores the downloaded book into R2**—since you are saving the book locally on your device, there is no reason to waste R2 cache space on it.
 * **JSON Metadata Cache:** The Worker never serves cached JSON metadata to a token unless your origin server has returned a `2xx` response for that exact token hash within the last **15 minutes** (`/__edge/v/<tokenHash>`).
 * **Unified `/` and `/audiobookshelf` Subpath Support:** Whether a client talks to `/api/...` (mobile apps) or `/audiobookshelf/api/...` (Web UI configured with a router base path), the Worker normalizes the canonical path so both share the exact same edge and R2 cache entries.
 

@@ -7,6 +7,10 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Read-Only R2 Acceleration for Local Book Downloads (`/api/items/:id/file/:ino` & `/s/item/:id/:file`):**
+  - When a user presses the **Download** button in the mobile app or Web UI, the Worker checks if the book is already cached in R2:
+    - If **already in R2** (`HIT`), the download is served directly from Cloudflare R2 at edge speed (after verifying the user's auth token).
+    - If **not in R2** (`MISS-NO-STORE`), the download streams directly from `ORIGIN` and **never warms or stores the book into R2**, avoiding wasting R2 storage on books being saved locally to a device.
 - **R2 Free-Tier Circuit Breaker (`FREE_TIER_GUARD`):**
   - Added an opt-out Free-Tier Guard (`FREE_TIER_GUARD="yes"` by default, set to `"no"` for unlimited paid R2 mode) that protects all three billable Cloudflare R2 dimensions:
     1. **Storage Volume Cap (`MAX_BUCKET_BYTES = 9,000,000,000` / 9.0 GB):** Enforces a 1.0 GB safety buffer under Cloudflare R2's 10 GB-month free tier using automatic oldest-book LRU eviction before every write.
