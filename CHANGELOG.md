@@ -7,6 +7,8 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Audio Streaming & Scrubbing Benchmark Script (`scripts/benchmark.mjs`):**
+  - Added `npm run benchmark` (`ABS_EDGE_URL`, `ABS_ORIGIN_URL`, `ABS_TOKEN`, optional `ABS_ITEM_ID`) to measure Origin vs. Edge (R2 `HIT`) play-start TTFB, random `64 KB` scrubbing/seeking latency, and `10 MB` streaming throughput, then close the temporary session cleanly.
 - **Offline-Origin Resilience (`STALE-IF-ERROR` & Queued Progress Writes):**
   - Falls back to serving expired edge-cached covers, library metadata, RSS feeds, and Web UI shell (`x-abs-cache: STALE-IF-ERROR`) if `ORIGIN` is unreachable or returns `502`/`503`/`504`/`520`–`530`.
   - Queues progress writes (`POST /api/session/:id/sync`, `POST /api/session/:id/close`, `PATCH /api/me/progress*`) into `abs-warm` (`x-abs-cache: QUEUED-OFFLINE`) when `ORIGIN` is offline and automatically replays them once `ORIGIN` recovers.

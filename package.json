@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --test"
+    "test": "node --test",
+    "benchmark": "node scripts/benchmark.mjs"
   },
   "cloudflare": {
     "bindings": {
