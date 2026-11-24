@@ -1,0 +1,57 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "abs-edge-cache",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-11-01",
+  "workers_dev": false,
+
+  // Replace with your Audiobookshelf origin URL and your desired Free Tier / Cache settings
+  "vars": {
+    "ORIGIN": "https://audiobookshelf-origin.example.com",
+    "FREE_TIER_GUARD": "yes",
+    "MAX_BUCKET_BYTES": "9000000000",
+    "MAX_CLASS_A_MONTH": "800000",
+    "MAX_CLASS_B_MONTH": "8000000",
+    "MAX_WARM_MB": "2000",
+    "COVER_TTL_S": "2592000",
+    "JSON_FRESH_S": "120",
+    "JSON_SWR_S": "3600"
+  },
+
+  // 1. KV Namespace: holds playback session mappings, cache epoch, and Free-Tier Circuit Breaker counters
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+
+  // 2. R2 Bucket: stores currently playing audiobook audio tracks at Cloudflare's edge
+  "r2_buckets": [
+    {
+      "binding": "CACHE",
+      "bucket_name": "abs-cache"
+    }
+  ],
+
+  // 3. Cloudflare Queue: warms audio tracks into R2 in the background when a book starts playing
+  //    IMPORTANT: keep max_concurrency = 1 so background track warming is serialized and never
+  //    races past MAX_BUCKET_BYTES.
+  "queues": {
+    "producers": [
+      {
+        "binding": "WARM",
+        "queue": "abs-warm"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "abs-warm",
+        "max_batch_size": 5,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "max_concurrency": 1
+      }
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "abs-edge-cache",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker + R2 + HTTP/3 (QUIC) edge caching front door for Audiobookshelf with an automatic Free-Tier Circuit Breaker.",
+  "private": false,
+  "type": "module",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": [
+    "audiobookshelf",
+    "cloudflare-workers",
+    "cloudflare-r2",
+    "cloudflare-queues",
+    "http3",
+    "quic",
+    "edge-cache",
+    "audiobooks"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
