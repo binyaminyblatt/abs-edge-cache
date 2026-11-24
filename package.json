@@ -7,7 +7,24 @@
   "main": "src/worker.js",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  },
+  "cloudflare": {
+    "bindings": {
+      "ORIGIN": {
+        "description": "Full base URL of your Audiobookshelf origin server (e.g., https://abs-origin.example.com)."
+      },
+      "FREE_TIER_GUARD": {
+        "description": "Set to 'yes' to enforce 9.0 GB R2 storage and monthly Class A/B free-tier limits, or 'no' for paid R2."
+      },
+      "WARM_WINDOW_TRACKS": {
+        "description": "Number of chapters/tracks to warm ahead in a sliding window for multi-file audiobooks (0 = warm entire book)."
+      },
+      "VERIFY_JWT": {
+        "description": "Set to 'yes' (with JWT_SECRET) to verify Audiobookshelf HS256 JWT signatures at the edge."
+      }
+    }
   },
   "keywords": [
     "audiobookshelf",

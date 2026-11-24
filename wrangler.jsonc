@@ -18,6 +18,7 @@
     "MAX_CLASS_A_MONTH": "800000",
     "MAX_CLASS_B_MONTH": "8000000",
     "MAX_WARM_MB": "2000",
+    "WARM_WINDOW_TRACKS": "5",
     "COVER_TTL_S": "2592000",
     "JSON_FRESH_S": "120",
     "JSON_SWR_S": "3600"

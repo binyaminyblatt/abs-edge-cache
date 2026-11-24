@@ -7,6 +7,11 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Sliding-Window Track Warming (`WARM_WINDOW_TRACKS`):**
+  - Bounds background R2 warming to `WARM_WINDOW_TRACKS` chapters from the active chapter forward (default `5`; set to `0` to warm the entire book immediately) and automatically advances the window as you listen through multi-file audiobooks.
+- **One-Click Deploy to Cloudflare Button & Test Suite:**
+  - Added the `Deploy to Cloudflare` button to `README.md` with binding descriptions in `package.json`.
+  - Added a `node --test` unit test suite (`npm test`) covering `206` byte-range R2 streaming, `WARM_WINDOW_TRACKS`, `FREE_TIER_GUARD`, `SESSION_LOCK`, `MAX_LOGIN_ATTEMPTS`, `VERIFY_JWT`, `epoch`/`pepoch` invalidation, and `304 Not Modified`.
 - **Smart `currentTime` Queue Warming Priority:**
   - Sorts `abs-warm` queue jobs using the session's `currentTime`, `startOffset`, and `duration` so the active chapter and subsequent chapters warm into R2 first, then wraps around to earlier chapters.
 - **Progress-Aware Edge Caching (`pepoch:<userId>`):**
