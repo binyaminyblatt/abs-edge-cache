@@ -7,6 +7,18 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 ## [1.0.0] - 2026-11-24
 
 ### Added
+- **Smart `currentTime` Queue Warming Priority:**
+  - Sorts `abs-warm` queue jobs using the session's `currentTime`, `startOffset`, and `duration` so the active chapter and subsequent chapters warm into R2 first, then wraps around to earlier chapters.
+- **Progress-Aware Edge Caching (`pepoch:<userId>`):**
+  - Caches `/api/libraries/:id/personalized`, `/api/me/progress`, `/api/me/items-in-progress`, `/api/me/listening-stats`, and `?include=progress` with a per-user progress epoch (`PJSON_FRESH_S = 60`, `PJSON_SWR_S = 600`) that invalidates immediately on `/play`, `/sync`, `/close`, or `PATCH /api/me/progress`.
+- **Edge `304 Not Modified` (`ETag` / `If-None-Match`) Short-Circuiting:**
+  - Returns `304 Not Modified` (0 bytes) at the edge when `If-None-Match` matches cached `ETag` headers on Edge Cache or R2 responses.
+- **Edge Brute-Force Login Rate Limiting (`MAX_LOGIN_ATTEMPTS = 5`):**
+  - Blocks IPs with `429 Too Many Requests` for 15 minutes after 5 failed `POST /login` or `POST /api/login` attempts.
+- **Device-Platform & Geo-Country Session Lock (`SESSION_LOCK = "yes"`):**
+  - Binds `sess:<sid>` to originating `cf.country` and player OS family, blocking cross-country or cross-OS session replay with `403 Forbidden` while permitting Wi-Fi ↔ cellular roaming.
+- **Hardened Security Headers:**
+  - Adds `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and `X-Frame-Options: SAMEORIGIN` while preserving Audiobookshelf's own CORS/CSP headers.
 - **Optional Cryptographic `HS256` JWT Verification & Session Revocation (`VERIFY_JWT` + `JWT_SECRET`):**
   - Added optional edge cryptographic verification (`VERIFY_JWT="no"` by default; enabled when `VERIFY_JWT="yes"` and `JWT_SECRET` is set to Audiobookshelf's `tokenSecret`) using Web Crypto `HMAC-SHA256`.
   - Validates JWT signatures, `exp` / `nbf` claims, and KV revocation tombstones (`revoked:<tokenHash>`) before serving any cached metadata, covers, status, or R2 audio/downloads.

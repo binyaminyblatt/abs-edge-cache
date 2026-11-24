@@ -12,6 +12,8 @@
     "ORIGIN": "https://audiobookshelf-origin.example.com",
     "FREE_TIER_GUARD": "yes",
     "VERIFY_JWT": "no",
+    "SESSION_LOCK": "yes",
+    "MAX_LOGIN_ATTEMPTS": "5",
     "MAX_BUCKET_BYTES": "9000000000",
     "MAX_CLASS_A_MONTH": "800000",
     "MAX_CLASS_B_MONTH": "8000000",

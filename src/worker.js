@@ -1,12 +1,13 @@
 // abs-edge-cache: Cloudflare Worker front door for Audiobookshelf
-// - blocks scanner/bot paths, proxies everything else to ORIGIN (supports root and /audiobookshelf base path)
-// - edge-caches Web UI HTML shell, CSS, JS (_nuxt/*), fonts, icons, book covers, and static metadata
-// - learns playback sessions, serves cached audio from R2, warms cache via Queue ONLY on active playback
+// - blocks scanner/bot paths, rate-limits brute-force logins at the edge, proxies everything else to ORIGIN
+// - edge-caches Web UI HTML shell, CSS, JS (_nuxt/*), fonts, icons, book covers, static metadata,
+//   and progress-aware personalized shelves/book details (invalidated instantly on progress sync or edits)
+// - supports Edge 304 Not Modified (ETag / If-None-Match) short-circuiting
+// - learns playback sessions, prioritizes warming the active chapter (currentTime) first via Queue,
+//   and serves cached audio from R2 with device-family + country session locking
 // - accelerates offline book downloads (/api/items/:id/file/:ino, /s/item/:id/:file) from R2 if ALREADY cached,
 //   without warming/storing downloaded books into R2 on a miss
-// - optional Cryptographic JWT Verification (VERIFY_JWT = "no" by default; set VERIFY_JWT = "yes" and provide
-//   JWT_SECRET from Audiobookshelf's tokenSecret to cryptographically verify HS256 JWTs, enforce exp/nbf,
-//   track token revocation/logout, and bind R2 playback sessions to verified tokens)
+// - optional Cryptographic JWT Verification (VERIFY_JWT = "yes" + JWT_SECRET)
 // - optional Free-Tier R2 Circuit Breaker (FREE_TIER_GUARD = "yes" by default; set to "no" for unlimited paid R2)
 
 const ID_RE = /^(li|ses|usr|lib|ser|aut|col|pl|ep|fol|dev)_[a-z0-9]+$/i;
@@ -17,6 +18,7 @@ const BLOCK_PATH = /^\/(actuator|_vti|wp-|wordpress|phpmyadmin|cgi-bin|server-st
 const BLOCK_EXT = /\.(php\d?|aspx?|jsp|cgi|sql|bak|ini|ya?ml|conf|env|git|log|swp|tar|gz|zip)$/i;
 const APP_PATH = /^\/(api|public|s|hls|socket\.io|login|logout|status|ping|auth|feed|_nuxt)(\/|$)/;
 const NOBUMP = /^\/api\/(session|me|authorize|items\/[^/]+\/play)(\/|$)/;
+const PROGRESS_WRITE_RE = /^\/api\/(session(\/|$)|me\/progress(\/|$)|items\/[^/]+\/play(\/|$))/;
 const STATIC_ASSET_RE = /^\/_nuxt\/.+|\.(css|js|mjs|woff2?|ttf|otf|eot|svg|ico|webp|png|jpg|jpeg|gif|webmanifest|map)$/i;
 const NON_HTML_PREFIX = /^\/(api|public|s|hls|socket\.io|auth|feed|logout|status|ping)(\/|$)/;
 
@@ -45,6 +47,45 @@ function isFreeTierGuardEnabled(env) {
 
 function isJwtVerifyEnabled(env) {
   return isTruthyFlag(env.VERIFY_JWT, false) && Boolean(env.JWT_SECRET && String(env.JWT_SECRET).trim());
+}
+
+function isSessionLockEnabled(env) {
+  return isTruthyFlag(env.SESSION_LOCK, true);
+}
+
+function applySecurityHeaders(h) {
+  if (!h.has("referrer-policy")) h.set("referrer-policy", "no-referrer");
+  if (!h.has("x-content-type-options")) h.set("x-content-type-options", "nosniff");
+  if (!h.has("x-frame-options")) h.set("x-frame-options", "SAMEORIGIN");
+}
+
+function checkNotModified(request, respHeaders, cacheLabel) {
+  if ((request.method !== "GET" && request.method !== "HEAD") || request.headers.has("range")) return null;
+  var inm = request.headers.get("if-none-match");
+  var etag = respHeaders.get("etag");
+  if (!inm || !etag) return null;
+  var cleanInm = inm.replace(/^W\//, "").trim();
+  var cleanEtag = etag.replace(/^W\//, "").trim();
+  if (cleanInm !== cleanEtag && inm.trim() !== "*") return null;
+  var h = new Headers();
+  h.set("etag", etag);
+  if (respHeaders.has("cache-control")) h.set("cache-control", respHeaders.get("cache-control"));
+  if (cacheLabel) h.set("x-abs-cache", cacheLabel);
+  h.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
+  applySecurityHeaders(h);
+  return new Response(null, { status: 304, headers: h });
+}
+
+function detectPlayerFamily(ua) {
+  if (!ua) return "unknown";
+  if (/AppleCoreMedia/i.test(ua)) return "apple-media";
+  if (/ExoPlayer|Android|Dalvik/i.test(ua)) return "android";
+  if (/iPhone|iPad|iPod|CFNetwork|Darwin/i.test(ua)) return "ios";
+  if (/Dart/i.test(ua)) return "dart";
+  if (/Windows/i.test(ua)) return "windows";
+  if (/Macintosh|Mac OS X/i.test(ua)) return "mac";
+  if (/Linux/i.test(ua)) return "linux";
+  return "other";
 }
 
 function monthKey() {
@@ -187,6 +228,45 @@ async function record(env, request, resp, url, cp) {
   } catch (e) {}
 }
 
+// ---------- Edge Brute-Force Login Rate Limiter ----------
+
+async function checkLoginRateLimit(env, request, url) {
+  try {
+    var ip = request.headers.get("cf-connecting-ip") || "unknown";
+    var maxAttempts = num(env.MAX_LOGIN_ATTEMPTS, 5);
+    if (maxAttempts <= 0) return { blocked: false, ip: ip };
+    var cacheKey = url.origin + "/__edge/loginfail/" + ip;
+    var hit = await caches.default.match(cacheKey);
+    var count = hit ? (parseInt(await hit.text(), 10) || 0) : 0;
+    if (count < maxAttempts && env.KV) {
+      var kvCount = parseInt((await env.KV.get("loginfail:" + ip, { cacheTtl: 30 })) || "0", 10) || 0;
+      if (kvCount > count) count = kvCount;
+    }
+    return { blocked: count >= maxAttempts, ip: ip, count: count };
+  } catch (e) { return { blocked: false, ip: "unknown" }; }
+}
+
+async function recordLoginResult(env, url, ip, success) {
+  try {
+    if (!ip || ip === "unknown") return;
+    var cacheKey = url.origin + "/__edge/loginfail/" + ip;
+    if (success) {
+      await caches.default.delete(cacheKey);
+      if (env.KV) await env.KV.delete("loginfail:" + ip);
+      return;
+    }
+    var hit = await caches.default.match(cacheKey);
+    var count = hit ? (parseInt(await hit.text(), 10) || 0) : 0;
+    if (env.KV) {
+      var kvCount = parseInt((await env.KV.get("loginfail:" + ip)) || "0", 10) || 0;
+      if (kvCount > count) count = kvCount;
+    }
+    var next = String(count + 1);
+    await caches.default.put(cacheKey, new Response(next, { headers: { "cache-control": "max-age=900" } }));
+    if (env.KV) await env.KV.put("loginfail:" + ip, next, { expirationTtl: 900 });
+  } catch (e) {}
+}
+
 // ---------- Auth, Optional HS256 Cryptographic JWT Verification & Revocation ----------
 
 async function sha16(s) {
@@ -245,8 +325,6 @@ async function getHmacKey(secret) {
   return cachedHmacKey;
 }
 
-// Cryptographically verifies an Audiobookshelf JWT (HS256) against env.JWT_SECRET,
-// checks exp and nbf timestamps, and checks KV revocation tombstones.
 async function verifyJwtToken(env, cred) {
   try {
     if (!cred) return { valid: false, reason: "missing_token" };
@@ -255,7 +333,8 @@ async function verifyJwtToken(env, cred) {
     var header = JSON.parse(new TextDecoder().decode(b64UrlToBytes(parts[0])));
     if (!header || header.alg !== "HS256") return { valid: false, reason: "unsupported_alg" };
 
-    var key = await getHmacKey(String(env.JWT_SECRET).trim());
+    var cleanSecret = String(env.JWT_SECRET).trim().replace(/^["']|["']$/g, "");
+    var key = await getHmacKey(cleanSecret);
     var data = new TextEncoder().encode(parts[0] + "." + parts[1]);
     var sig = b64UrlToBytes(parts[2]);
     var ok = await crypto.subtle.verify("HMAC", key, sig, data);
@@ -330,7 +409,7 @@ async function isCredentialValid(env, request, url) {
   return Boolean(await caches.default.match(k));
 }
 
-// ---------- edge cache for Web UI assets (HTML/CSS/JS), covers & static metadata ----------
+// ---------- edge cache for Web UI assets (HTML/CSS/JS), covers, static & progress-aware metadata ----------
 
 function normQuery(url) {
   var ps = [];
@@ -347,13 +426,19 @@ function classify(cp, search, request) {
     var accept = request.headers.get("accept") || "";
     if (accept.indexOf("text/html") !== -1) return "html";
   }
-  if (/progress|rssfeed/i.test(search)) return null;
+  if (/rssfeed/i.test(search)) return null;
+  if (/^\/api\/libraries\/[^/]+\/personalized$/.test(cp)
+    || /^\/api\/me\/(progress|items-in-progress|listening-stats)$/.test(cp)) {
+    return "pjson";
+  }
   if (/^\/api\/libraries$/.test(cp)
     || /^\/api\/libraries\/[^/]+(\/(items|series|authors|collections|filterdata|stats))?$/.test(cp)
     || /^\/api\/items\/[^/]+$/.test(cp)
     || /^\/api\/authors\/[^/]+$/.test(cp)
     || /^\/api\/series\/[^/]+$/.test(cp)
-    || /^\/api\/collections(\/[^/]+)?$/.test(cp)) return "json";
+    || /^\/api\/collections(\/[^/]+)?$/.test(cp)) {
+    return /progress/i.test(search) ? "pjson" : "json";
+  }
   return null;
 }
 
@@ -373,6 +458,27 @@ async function bumpEpoch(env, base) {
   } catch (e) {}
 }
 
+async function getProgressEpoch(env, cache, base, user) {
+  if (!user) return 0;
+  var local = 0, remote = 0;
+  var lm = await cache.match(base + "pepoch/" + user);
+  if (lm) local = parseInt(await lm.text(), 10) || 0;
+  if (env.KV) remote = parseInt((await env.KV.get("pepoch:" + user, { cacheTtl: 10 })) || "0", 10) || 0;
+  return Math.max(local, remote);
+}
+
+async function bumpProgressEpoch(env, request, url, base) {
+  try {
+    var cred = credential(request, url);
+    if (!cred) return;
+    var user = userOf(cred) || (await sha16(cred));
+    if (!user) return;
+    var now = String(Date.now());
+    await caches.default.put(base + "pepoch/" + user, new Response(now, { headers: { "cache-control": "max-age=86400" } }));
+    if (env.KV) await env.KV.put("pepoch:" + user, now, { expirationTtl: 604800 });
+  } catch (e) {}
+}
+
 async function store(key, resp, ttl, kind) {
   try {
     if (kind === "html") {
@@ -383,15 +489,20 @@ async function store(key, resp, ttl, kind) {
     h.delete("set-cookie"); h.delete("content-encoding"); h.delete("content-length");
     h.set("x-cached-at", String(Date.now()));
     h.set("cache-control", "max-age=" + ttl);
+    applySecurityHeaders(h);
     await caches.default.put(key, new Response(resp.body, { status: 200, headers: h }));
     return true;
   } catch (e) { return false; }
 }
 
-function tag(hit, label) {
+function tag(request, hit, label) {
+  var notMod = checkNotModified(request, hit.headers, label);
+  if (notMod) return notMod;
   var r = new Response(hit.body, hit);
   r.headers.set("x-abs-cache", label);
+  r.headers.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
   r.headers.delete("x-cached-at");
+  applySecurityHeaders(r.headers);
   return r;
 }
 
@@ -414,30 +525,36 @@ async function edgeLookup(request, env, ctx, url, cp, kind) {
     var ch = cred ? await sha16(cred) : "";
     var cache = caches.default, base = url.origin + "/__edge/";
     var user = cred ? (userOf(cred) || ch) : "anon";
-    var prefix = kind === "cover" ? "c|" : (kind === "asset" ? "a|" : (kind === "html" ? "h|" + url.pathname + "|" : "j|" + user + "|"));
+    var prefix = kind === "cover" ? "c|"
+      : (kind === "asset" ? "a|"
+      : (kind === "html" ? "h|" + url.pathname + "|"
+      : (kind === "pjson" ? "pj|" + user + "|" : "j|" + user + "|")));
     var keyStr = (kind === "html" ? prefix + normQuery(url) : prefix + cp + "|" + normQuery(url));
     var key = base + "d/" + (await sha16(keyStr));
     var fresh = (kind === "cover" || kind === "asset")
       ? num(env.COVER_TTL_S, 2592000)
-      : (kind === "html" ? num(env.HTML_FRESH_S, 300) : num(env.JSON_FRESH_S, 120));
+      : (kind === "html" ? num(env.HTML_FRESH_S, 300)
+      : (kind === "pjson" ? num(env.PJSON_FRESH_S, 60) : num(env.JSON_FRESH_S, 120)));
     var swr = (kind === "cover" || kind === "asset")
       ? 0
-      : (kind === "html" ? num(env.HTML_SWR_S, 86400) : num(env.JSON_SWR_S, 3600));
+      : (kind === "html" ? num(env.HTML_SWR_S, 86400)
+      : (kind === "pjson" ? num(env.PJSON_SWR_S, 600) : num(env.JSON_SWR_S, 3600)));
     out.fill = { key: key, ttl: fresh + swr + 60, kind: kind };
     var parts = await Promise.all([
       isPublicKind ? Promise.resolve(true) : isCredentialValid(env, request, url),
       cache.match(key),
-      kind === "asset" ? Promise.resolve(0) : getEpoch(env, cache, base)
+      kind === "asset" ? Promise.resolve(0) : getEpoch(env, cache, base),
+      kind === "pjson" ? getProgressEpoch(env, cache, base, user) : Promise.resolve(0)
     ]);
-    var valid = parts[0], hit = parts[1], epoch = parts[2];
+    var valid = parts[0], hit = parts[1], epoch = Math.max(parts[2], parts[3]);
     if (valid && hit) {
       var at = parseInt(hit.headers.get("x-cached-at") || "0", 10);
       if (at > epoch) {
         var age = (Date.now() - at) / 1000;
-        if (age <= fresh) { out.res = tag(hit, "HIT"); return out; }
+        if (age <= fresh) { out.res = tag(request, hit, "HIT"); return out; }
         if (age <= fresh + swr) {
           ctx.waitUntil(refresh(request, env, url, key, out.fill.ttl, kind));
-          out.res = tag(hit, "STALE");
+          out.res = tag(request, hit, "STALE");
           return out;
         }
       }
@@ -446,7 +563,7 @@ async function edgeLookup(request, env, ctx, url, cp, kind) {
   return out;
 }
 
-// ---------- audio: session tracking, R2 serving, 9 GB cap, circuit breaker ----------
+// ---------- audio: session tracking, smart currentTime warming, R2 serving, 9 GB cap ----------
 
 async function listAllObjects(env, prefix) {
   var objects = [], cursor = undefined, listCalls = 0;
@@ -613,6 +730,9 @@ async function learnSessionData(env, s, request, url) {
       userId = v.userId || userId;
       tokenHash = v.tokenHash || tokenHash;
     }
+    var country = (request && request.cf && request.cf.country) ? String(request.cf.country) : "";
+    var curTime = (s && typeof s.currentTime === "number") ? s.currentTime : 0;
+    var activeJobIdx = 0;
     var tracks = {}, jobs = [];
     for (var i = 0; i < s.audioTracks.length; i++) {
       var t = s.audioTracks[i];
@@ -621,6 +741,11 @@ async function learnSessionData(env, s, request, url) {
       var size = (t.metadata && t.metadata.size) || 0;
       var key = item + "/track-" + n;
       var mime = t.mimeType || "";
+      var startOff = typeof t.startOffset === "number" ? t.startOffset : 0;
+      var dur = typeof t.duration === "number" ? t.duration : 0;
+      if (curTime > 0 && curTime >= startOff && (dur <= 0 || curTime < startOff + dur)) {
+        activeJobIdx = jobs.length;
+      }
       tracks[n] = { key: key, size: size, mime: mime };
       jobs.push({ sid: sid, item: item, n: n, key: key, size: size, mime: mime });
     }
@@ -628,6 +753,8 @@ async function learnSessionData(env, s, request, url) {
       item: item,
       userId: userId,
       tokenHash: tokenHash,
+      country: country,
+      playerFamily: "",
       closed: false,
       tracks: tracks
     }), { expirationTtl: 172800 });
@@ -640,7 +767,10 @@ async function learnSessionData(env, s, request, url) {
       if (lim.guardEnabled && lim.maxBytes > 0) maxBookBytes = Math.min(maxBookBytes, lim.maxBytes);
       var total = jobs.reduce(function (a, j) { return a + j.size; }, 0);
       if (total > maxBookBytes) return;
-      for (var j of jobs) {
+      // Smart Queue Ordering: warm the currently playing track and subsequent chapters FIRST,
+      // then wrap around to earlier chapters.
+      var prioritized = jobs.slice(activeJobIdx).concat(jobs.slice(0, activeJobIdx));
+      for (var j of prioritized) {
         await enqueueTrackJob(env, j);
       }
     }
@@ -699,10 +829,14 @@ async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
     hh.set("accept-ranges", "bytes");
     hh.set("etag", h.httpEtag);
     hh.set("x-abs-cache", "HIT");
+    hh.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
     if (t.mime) hh.set("content-type", t.mime);
     if (isDownload && t.filename) {
       hh.set("content-disposition", 'attachment; filename="' + t.filename.replace(/"/g, "") + '"');
     }
+    applySecurityHeaders(hh);
+    var notModHead = checkNotModified(request, hh, "HIT");
+    if (notModHead) return notModHead;
     return new Response(null, { status: 200, headers: hh });
   }
   var rangeHdr = request.headers.get("range");
@@ -714,10 +848,14 @@ async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
   headers.set("etag", obj.httpEtag);
   headers.set("accept-ranges", "bytes");
   headers.set("x-abs-cache", "HIT");
+  headers.set("x-abs-probe", (request.cf && request.cf.httpProtocol) || "unknown");
   if (t.mime) headers.set("content-type", t.mime);
   if (isDownload && t.filename) {
     headers.set("content-disposition", 'attachment; filename="' + t.filename.replace(/"/g, "") + '"');
   }
+  applySecurityHeaders(headers);
+  var notMod = checkNotModified(request, headers, "HIT");
+  if (notMod) return notMod;
   var status = 200;
   if (rangeHdr && obj.range) {
     var r = obj.range, off, len;
@@ -735,38 +873,51 @@ async function buildR2TrackResponse(request, env, ctx, t, isDownload) {
 async function serveFromCache(request, env, ctx, url, sid, n) {
   try {
     var r2State = await getR2State(env, false);
-    if (r2State.tripped) return { hit: null, bypassed: true };
+    if (r2State.tripped) return { hit: null, bypassed: true, forbidden: false };
     var raw = await env.KV.get("sess:" + sid);
-    if (!raw) return { hit: null, bypassed: false };
+    if (!raw) return { hit: null, bypassed: false, forbidden: false };
     var sess = JSON.parse(raw);
-    if (sess.closed) return { hit: null, bypassed: false };
+    if (sess.closed) return { hit: null, bypassed: false, forbidden: false };
 
-    // Check if the token that opened this session has been revoked/logged out
     if (sess.tokenHash && env.KV) {
       var rev = await env.KV.get("revoked:" + sess.tokenHash, { cacheTtl: 60 });
-      if (rev) return { hit: null, bypassed: false };
+      if (rev) return { hit: null, bypassed: false, forbidden: true };
     }
 
-    // If VERIFY_JWT is enabled and the client supplies a token (header, query, or cookie),
-    // cryptographically verify it and enforce that it belongs to the session owner!
+    // Device-Platform & Geo-Country Lock (prevents cross-country / cross-OS replay of leaked session URLs
+    // while allowing seamless Wi-Fi <-> cellular handoffs on the same device)
+    if (isSessionLockEnabled(env)) {
+      var reqCountry = (request.cf && request.cf.country) ? String(request.cf.country) : "";
+      if (sess.country && reqCountry && sess.country !== reqCountry) {
+        return { hit: null, bypassed: false, forbidden: true };
+      }
+      var reqFam = detectPlayerFamily(request.headers.get("user-agent") || "");
+      if (!sess.playerFamily && reqFam !== "unknown") {
+        sess.playerFamily = reqFam;
+        ctx.waitUntil(env.KV.put("sess:" + sid, JSON.stringify(sess), { expirationTtl: 172800 }));
+      } else if (sess.playerFamily && reqFam !== "unknown" && sess.playerFamily !== reqFam) {
+        return { hit: null, bypassed: false, forbidden: true };
+      }
+    }
+
     var cred = credential(request, url);
     if (isJwtVerifyEnabled(env) && cred) {
       var v = await verifyJwtToken(env, cred);
-      if (!v.valid) return { hit: null, bypassed: false };
+      if (!v.valid) return { hit: null, bypassed: false, forbidden: true };
       if (sess.userId && v.userId && sess.userId !== v.userId) {
-        return { hit: null, bypassed: false };
+        return { hit: null, bypassed: false, forbidden: true };
       }
     }
 
     var t = (sess.tracks && sess.tracks[n]) || (sess.item ? { key: sess.item + "/track-" + n, size: 0, mime: "" } : null);
-    if (!t) return { hit: null, bypassed: false };
+    if (!t) return { hit: null, bypassed: false, forbidden: false };
     var resp = await buildR2TrackResponse(request, env, ctx, t, false);
     if (!resp) {
       ctx.waitUntil(enqueueTrackJob(env, { sid: sid, item: sess.item, n: String(n), key: t.key, size: t.size || 0, mime: t.mime || "" }));
-      return { hit: null, bypassed: false };
+      return { hit: null, bypassed: false, forbidden: false };
     }
-    return { hit: resp, bypassed: false };
-  } catch (e) { return { hit: null, bypassed: false }; }
+    return { hit: resp, bypassed: false, forbidden: false };
+  } catch (e) { return { hit: null, bypassed: false, forbidden: false }; }
 }
 
 async function serveDownloadFromCacheIfPresent(request, env, ctx, url, itemId, ino, filename, isExplicitDownload) {
@@ -818,14 +969,29 @@ export default {
     var cp = stripBase(p);
     var origin = new URL(env.ORIGIN);
 
+    // Edge Brute-Force Login Rate Limiter (5 failed attempts -> 15 min block at edge)
+    var isLoginPost = (request.method === "POST" && (/^\/login(\/|$)/.test(cp) || /^\/api\/login(\/|$)/.test(cp)));
+    var loginCheck = isLoginPost ? await checkLoginRateLimit(env, request, url) : null;
+    if (loginCheck && loginCheck.blocked) {
+      var rlHeaders = new Headers({ "content-type": "application/json", "retry-after": "900" });
+      applySecurityHeaders(rlHeaders);
+      return new Response(JSON.stringify({ error: "Too many failed login attempts. Please try again in 15 minutes." }), {
+        status: 429,
+        headers: rlHeaders
+      });
+    }
+
     if (cp === "/__abs-cache/status" && request.method === "GET") {
       if (!(await isCredentialValid(env, request, url))) return new Response("Unauthorized", { status: 401 });
       var st = await getR2State(env, true);
       var lim = getLimits(env);
+      var stHeaders = new Headers({ "content-type": "application/json" });
+      applySecurityHeaders(stHeaders);
       return new Response(JSON.stringify({
         month: monthKey().replace("r2:usage:", ""),
         freeTierGuard: lim.guardEnabled ? "yes" : "no",
         verifyJwt: isJwtVerifyEnabled(env) ? "yes" : "no",
+        sessionLock: isSessionLockEnabled(env) ? "yes" : "no",
         circuitBreakerTripped: st.tripped,
         reason: st.reason || (lim.guardEnabled ? "OK (within Free Tier safety limits)" : "FREE_TIER_GUARD=no (kill switches disabled)"),
         storage: lim.guardEnabled ? {
@@ -837,7 +1003,7 @@ export default {
         } : "unlimited",
         classAOps: lim.guardEnabled ? { used: st.a + pendingClassA, max: lim.maxClassA, freeTier: 1000000 } : "unlimited",
         classBOps: lim.guardEnabled ? { used: st.b + pendingClassB, max: lim.maxClassB, freeTier: 10000000 } : "unlimited"
-      }, null, 2), { status: 200, headers: { "content-type": "application/json" } });
+      }, null, 2), { status: 200, headers: stHeaders });
     }
 
     // 1. Active session audio streaming (/public/session/:sid/track/:n): serves from R2 and warms on miss
@@ -845,6 +1011,11 @@ export default {
     var r2Bypassed = false;
     if (m && env.CACHE && env.KV && (request.method === "GET" || request.method === "HEAD")) {
       var res = await serveFromCache(request, env, ctx, url, m[1], m[2]);
+      if (res.forbidden) {
+        var fbHeaders = new Headers({ "x-abs-cache": "BLOCKED-SESSION-LOCK" });
+        applySecurityHeaders(fbHeaders);
+        return new Response("Forbidden: session locked to originating device/user", { status: 403, headers: fbHeaders });
+      }
       if (res.hit) { ctx.waitUntil(record(env, request, res.hit, url, cp)); return res.hit; }
       r2Bypassed = res.bypassed;
     }
@@ -891,9 +1062,19 @@ export default {
     var target = new URL(p + url.search, origin);
     var resp = await fetch(new Request(target.toString(), request), { redirect: "manual" });
 
-    // If user logged out or origin rejected the token with 401/403, immediately revoke the token at the edge
-    if (isLogout || ((cp.indexOf("/api/") === 0 || cp.indexOf("/s/") === 0) && (resp.status === 401 || resp.status === 403))) {
+    if (isLoginPost && loginCheck) {
+      ctx.waitUntil(recordLoginResult(env, url, loginCheck.ip, resp.ok));
+    }
+
+    if (isLogout) {
       ctx.waitUntil(revokeToken(env, request, url));
+    } else if ((cp.indexOf("/api/") === 0 || cp.indexOf("/s/") === 0) && (resp.status === 401 || resp.status === 403)) {
+      ctx.waitUntil((async function () {
+        try {
+          var c = credential(request, url);
+          if (c) await caches.default.delete(url.origin + "/__edge/v/" + (await sha16(c)));
+        } catch (e) {}
+      })());
     }
     if (closeMatch && resp.ok) {
       ctx.waitUntil(closeSessionInKv(env, closeMatch[1]));
@@ -906,6 +1087,11 @@ export default {
     }
     if (request.method === "GET" && env.KV && resp.status === 200 && /^\/api\/items\/[^/]+$/.test(cp)) {
       ctx.waitUntil(learnItemDetails(env, resp.clone()));
+    }
+    // Bump per-user progress epoch whenever listening progress or session state mutates
+    if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS"
+        && resp.status < 400 && PROGRESS_WRITE_RE.test(cp)) {
+      ctx.waitUntil(bumpProgressEpoch(env, request, url, url.origin + "/__edge/"));
     }
     if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS"
         && cp.indexOf("/api/") === 0 && resp.status < 400 && !NOBUMP.test(cp)) {
@@ -941,6 +1127,7 @@ export default {
     if (r2Bypassed) out.headers.set("x-abs-cache", "BYPASS-LIMIT");
     else if (m || filled) out.headers.set("x-abs-cache", "MISS");
     else if (dlIno || dlFile) out.headers.set("x-abs-cache", "MISS-NO-STORE");
+    applySecurityHeaders(out.headers);
     ctx.waitUntil(record(env, request, out, url, cp));
     return out;
   },

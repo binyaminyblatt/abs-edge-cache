@@ -97,14 +97,18 @@ Instead:
 ### Why Use R2 for Audio Instead of Cloudflare's Standard Edge Cache?
 Cloudflare's standard CDN cache (`caches.default`) is great for small cover images and JSON responses, but it is **per-colo (per data center)** and **evicts large audio files unpredictably** if you haven't requested that specific chunk from that specific POP recently. If you switch from Wi-Fi to cellular and route to a neighboring POP, standard edge cache misses. **R2 is persistent object storage**: once a book is warmed into `abs-cache`, it stays pinned and accessible from **every Cloudflare edge location worldwide** across all your devices until you finish the book, the 9 GB LRU evictor rotates it out, or the 7-day lifecycle rule expires it.
 
-### Why Are Listening Progress Endpoints Never Cached?
-If `GET /api/me/progress`, `GET /api/libraries/:id/personalized`, or `GET /api/items/:id?include=progress` returned a cached response that was even 60 seconds old, reopening the app on another device could overwrite your resume position and jump backward in your book.
-* **Rule:** Any endpoint or query carrying user progress (`progress`, `rssfeed`, `/api/me/*`, `/api/libraries/:id/personalized`, `/api/session/*`) always goes straight to your origin server.
-* **What *is* cached at the edge:**
+### Why Are Listening Progress Endpoints Cached with a Per-User Progress Epoch?
+If `GET /api/me/progress`, `GET /api/libraries/:id/personalized`, or `GET /api/items/:id?include=progress` returned a stale cached response, reopening the app on another device could jump backward in your book.
+* **Rule:** Progress-bearing endpoints (`pjson`: `/api/libraries/:id/personalized`, `/api/me/progress`, `/api/me/items-in-progress`, `/api/me/listening-stats`, and `?include=progress`) use a **per-user progress epoch** (`pepoch:<userId>`).
+  * Every time that user opens a session (`/play`), syncs progress (`/sync`), closes a session (`/close`), or updates progress (`PATCH /api/me/progress`), `pepoch:<userId>` bumps immediately so the very next Home screen or book detail request fetches fresh progress from `ORIGIN`.
+  * Between progress writes, repeated Home screen and book detail loads hit the edge (`PJSON_FRESH_S = 60`, `PJSON_SWR_S = 600`) in `0 ms`!
+* **What else is cached at the edge:**
   * **Web UI Static Bundles (`/_nuxt/*`, `.js`, `.css`, `.woff2`, `.svg`, `.ico`, `.webmanifest`):** Content-hashed Nuxt JS/CSS bundles, fonts, and icons are cached at Cloudflare's edge for **30 days** (`COVER_TTL_S`).
   * **Web UI SPA HTML Shell (`/`, `/login`, `/library/*`, etc., plus `/sw.js`):** Cached at Cloudflare's edge with a **5-minute fresh window** (`HTML_FRESH_S = 300`) and a **24-hour Stale-While-Revalidate window** (`HTML_SWR_S = 86400`) so the Web UI loads instantaneously while still picking up Audiobookshelf server updates automatically.
   * **Covers & Author Images (`/api/items/:id/cover`, `/api/authors/:id/image`):** Cached for **30 days** (`COVER_TTL_S`), keyed by query parameters (`width`, `format`, `raw`, `ts`).
-  * **Static Library & Metadata Lists (`/api/libraries`, `/api/libraries/:id/items`, `/series`, `/authors`, `/collections`, `/filterdata`, `/stats`):** Cached per user with a **2-minute fresh window** (`JSON_FRESH_S = 120`) and a **1-hour Stale-While-Revalidate window** (`JSON_SWR_S = 3600`). After 2 minutes, the cached list is returned instantly (`0 ms` origin wait) while the Worker refreshes it in the background.
+  * **Static Library & Metadata Lists (`/api/libraries`, `/api/libraries/:id/items`, `/series`, `/authors`, `/collections`, `/filterdata`, `/stats`):** Cached per user with a **2-minute fresh window** (`JSON_FRESH_S = 120`) and a **1-hour Stale-While-Revalidate window** (`JSON_SWR_S = 3600`).
+  * **Edge `304 Not Modified` (`ETag` / `If-None-Match`):** Whenever a client sends a matching `If-None-Match` header for cached covers, assets, HTML, JSON, or R2 audio, the Worker short-circuits with `304 Not Modified` (0 bytes).
+  * **Smart `currentTime` Queue Warming:** When you press Play mid-book, the Queue sorts tracks so the **currently playing chapter and subsequent chapters warm into R2 first**, then wraps around to earlier chapters.
 
 ### How Instant Edit Invalidation Works (Epoch Counter)
 What if you edit a book's title, match metadata, or upload a new cover? You don't want to see stale metadata for 2 minutes or a stale cover for 30 days.
@@ -140,6 +144,9 @@ What if you edit a book's title, match metadata, or upload a new cover? You don'
     npx wrangler secret put JWT_SECRET
     # Paste your tokenSecret value when prompted, then set "VERIFY_JWT": "yes" in wrangler.jsonc
     ```
+* **Edge Brute-Force Login Rate Limiter (`MAX_LOGIN_ATTEMPTS`):** Failed `POST /login` or `POST /api/login` attempts are counted per client IP (`CF-Connecting-IP`). After `5` failed attempts, the IP is blocked at Cloudflare's edge with `429 Too Many Requests` for 15 minutes before reaching your home server.
+* **Device-Platform & Geo-Country Session Lock (`SESSION_LOCK = "yes"`):** Playback sessions (`sess:<sid>`) are bound to the originating country (`cf.country`) and player OS family (e.g. `apple-media`, `android`, `windows`). Your phone can freely roam between Wi-Fi and cellular on the same device, while cross-country or cross-OS session replay attempts are blocked with `403 Forbidden`.
+* **Hardened Security Headers:** Every response sets `Referrer-Policy: no-referrer` (preventing `?token=` or `/public/session/:sid/` leaks in `Referer` headers), `X-Content-Type-Options: nosniff`, and `X-Frame-Options: SAMEORIGIN`, while preserving Audiobookshelf's own CORS/CSP headers.
 * **Unified `/` and `/audiobookshelf` Subpath Support:** Whether a client talks to `/api/...` (mobile apps) or `/audiobookshelf/api/...` (Web UI configured with a router base path), the Worker normalizes the canonical path so both share the exact same edge and R2 cache entries.
 
 ---
@@ -184,6 +191,8 @@ All settings are configured via environment variables (`vars` in `wrangler.jsonc
 | `ORIGIN` | *(required)* | Origin URL of your Audiobookshelf instance (must be reachable by Cloudflare, e.g. via Cloudflare Tunnel). |
 | `VERIFY_JWT` | `"no"` | Set to `"yes"` (along with the `JWT_SECRET` Worker Secret) to enable cryptographic `HS256` JWT signature verification, `exp`/`nbf` enforcement, cover-cache auth enforcement, and session-to-user binding at the edge. Disabled (`"no"`) by default. |
 | `JWT_SECRET` | *(optional secret)* | Your Audiobookshelf server's `tokenSecret` (extracted from `/config/absdatabase.sqlite` or your server's env vars). Store via `npx wrangler secret put JWT_SECRET`. |
+| `SESSION_LOCK` | `"yes"` | Binds playback sessions (`sess:<sid>`) to the originating country and player OS family (`403` on mismatch), while still allowing seamless Wi-Fi ↔ cellular roaming. Set to `"no"` to disable. |
+| `MAX_LOGIN_ATTEMPTS` | `"5"` | Maximum failed `POST /login` attempts per IP before blocking with `429 Too Many Requests` for 15 minutes (`0` disables rate limiting). |
 | `FREE_TIER_GUARD` | `"yes"` | Set to `"yes"` (default) to enforce the 9.0 GB storage cap and monthly Class A/B kill switches. Set to `"no"` (or `"false"` / `"off"` / `"0"`) to disable all R2 kill switches for paid R2 usage. |
 | `MAX_BUCKET_BYTES` | `"9000000000"` | Maximum R2 bucket size in bytes when `FREE_TIER_GUARD="yes"`. Default is `9,000,000,000` (9.0 GB decimal / ~8.38 GiB), leaving 1.0 GB below R2's 10 GB free tier. |
 | `MAX_BUCKET_MB` | `"9000"` | Alternative to `MAX_BUCKET_BYTES` specified in decimal megabytes (`1 MB = 1,000,000 bytes`). |
@@ -195,6 +204,10 @@ All settings are configured via environment variables (`vars` in `wrangler.jsonc
 | `COVER_TTL_S` | `"2592000"` | Edge cache TTL in seconds for book covers and author images (default: 30 days). |
 | `JSON_FRESH_S` | `"120"` | Edge cache fresh window in seconds for static library/metadata JSON before Stale-While-Revalidate kicks in (default: 2 minutes). |
 | `JSON_SWR_S` | `"3600"` | Edge cache Stale-While-Revalidate window in seconds for static JSON metadata (default: 1 hour). |
+| `PJSON_FRESH_S` | `"60"` | Edge cache fresh window in seconds for progress-aware endpoints (`/personalized`, `/me/progress`) between `pepoch` bumps (default: 1 minute). |
+| `PJSON_SWR_S` | `"600"` | Edge cache Stale-While-Revalidate window in seconds for progress-aware endpoints (default: 10 minutes). |
+| `HTML_FRESH_S` | `"300"` | Edge cache fresh window in seconds for the Web UI SPA HTML shell and `/sw.js` (default: 5 minutes). |
+| `HTML_SWR_S` | `"86400"` | Edge cache Stale-While-Revalidate window in seconds for the Web UI SPA HTML shell (default: 24 hours). |
 
 ---
 
