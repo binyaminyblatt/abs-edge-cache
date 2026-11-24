@@ -675,6 +675,23 @@ async function enqueueTrackJob(env, job) {
   } catch (e) {}
 }
 
+async function warmSlidingWindow(env, sid, sess, currentTrackN, winCount) {
+  try {
+    if (!env.CACHE || !env.WARM || !sess || !Array.isArray(sess.trackOrder) || winCount <= 0) return;
+    var winFlag = "win:" + sid + ":" + currentTrackN;
+    if (env.KV && (await env.KV.get(winFlag))) return;
+    var idx = sess.trackOrder.indexOf(String(currentTrackN));
+    if (idx < 0) return;
+    var slice = sess.trackOrder.slice(idx, idx + winCount);
+    for (var n of slice) {
+      var t = sess.tracks && sess.tracks[n];
+      if (!t || !t.key) continue;
+      await enqueueTrackJob(env, { sid: sid, item: sess.item, n: String(n), key: t.key, size: t.size || 0, mime: t.mime || "" });
+    }
+    if (env.KV) await env.KV.put(winFlag, "1", { expirationTtl: 900 });
+  } catch (e) {}
+}
+
 async function saveItemFileMap(env, itemId, tracksArr, libraryFilesArr) {
   try {
     if (!env.KV || !itemId || !Array.isArray(tracksArr) || !tracksArr.length) return null;
@@ -756,6 +773,7 @@ async function learnSessionData(env, s, request, url) {
       country: country,
       playerFamily: "",
       closed: false,
+      trackOrder: jobs.map(function (j) { return j.n; }),
       tracks: tracks
     }), { expirationTtl: 172800 });
     await saveItemFileMap(env, item, s.audioTracks, s.libraryItem && s.libraryItem.libraryFiles);
@@ -768,9 +786,11 @@ async function learnSessionData(env, s, request, url) {
       var total = jobs.reduce(function (a, j) { return a + j.size; }, 0);
       if (total > maxBookBytes) return;
       // Smart Queue Ordering: warm the currently playing track and subsequent chapters FIRST,
-      // then wrap around to earlier chapters.
+      // then wrap around to earlier chapters (bounded by WARM_WINDOW_TRACKS if > 0).
       var prioritized = jobs.slice(activeJobIdx).concat(jobs.slice(0, activeJobIdx));
-      for (var j of prioritized) {
+      var winCount = num(env.WARM_WINDOW_TRACKS, 5);
+      var toWarm = (winCount > 0) ? prioritized.slice(0, winCount) : prioritized;
+      for (var j of toWarm) {
         await enqueueTrackJob(env, j);
       }
     }
@@ -911,6 +931,10 @@ async function serveFromCache(request, env, ctx, url, sid, n) {
 
     var t = (sess.tracks && sess.tracks[n]) || (sess.item ? { key: sess.item + "/track-" + n, size: 0, mime: "" } : null);
     if (!t) return { hit: null, bypassed: false, forbidden: false };
+    var winCount = num(env.WARM_WINDOW_TRACKS, 5);
+    if (winCount > 0 && Array.isArray(sess.trackOrder) && env.WARM && env.CACHE) {
+      ctx.waitUntil(warmSlidingWindow(env, sid, sess, String(n), winCount));
+    }
     var resp = await buildR2TrackResponse(request, env, ctx, t, false);
     if (!resp) {
       ctx.waitUntil(enqueueTrackJob(env, { sid: sid, item: sess.item, n: String(n), key: t.key, size: t.size || 0, mime: t.mime || "" }));

@@ -2,6 +2,8 @@
 
 **A Cloudflare Worker + R2 + HTTP/3 (QUIC) edge-caching front door for [Audiobookshelf](https://www.audiobookshelf.org/)—with an automatic Free-Tier Circuit Breaker.**
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/binyaminyblatt/abs-edge-cache)
+
 `abs-edge-cache` sits in front of your self-hosted Audiobookshelf server (for example, behind a Cloudflare Tunnel) and turns Cloudflare's global edge into a smart, zero-maintenance caching layer for **currently playing audiobooks**, **cover art**, and **library metadata**, while keeping your full multi-terabyte library on your home server and working transparently with official Audiobookshelf mobile apps and the Web UI.
 
 ---
@@ -108,7 +110,7 @@ If `GET /api/me/progress`, `GET /api/libraries/:id/personalized`, or `GET /api/i
   * **Covers & Author Images (`/api/items/:id/cover`, `/api/authors/:id/image`):** Cached for **30 days** (`COVER_TTL_S`), keyed by query parameters (`width`, `format`, `raw`, `ts`).
   * **Static Library & Metadata Lists (`/api/libraries`, `/api/libraries/:id/items`, `/series`, `/authors`, `/collections`, `/filterdata`, `/stats`):** Cached per user with a **2-minute fresh window** (`JSON_FRESH_S = 120`) and a **1-hour Stale-While-Revalidate window** (`JSON_SWR_S = 3600`).
   * **Edge `304 Not Modified` (`ETag` / `If-None-Match`):** Whenever a client sends a matching `If-None-Match` header for cached covers, assets, HTML, JSON, or R2 audio, the Worker short-circuits with `304 Not Modified` (0 bytes).
-  * **Smart `currentTime` Queue Warming:** When you press Play mid-book, the Queue sorts tracks so the **currently playing chapter and subsequent chapters warm into R2 first**, then wraps around to earlier chapters.
+  * **Smart `currentTime` Sliding-Window Queue Warming (`WARM_WINDOW_TRACKS`):** When you press Play mid-book, the Queue sorts tracks so the **currently playing chapter and subsequent chapters warm into R2 first**, bounded by `WARM_WINDOW_TRACKS` (default `5` tracks; set to `0` to warm the entire book immediately). As you listen through a multi-file audiobook, the sliding window automatically warms upcoming chapters ahead of you—preventing wasted R2 writes and storage if you abandon a long multi-file book early.
 
 ### How Instant Edit Invalidation Works (Epoch Counter)
 What if you edit a book's title, match metadata, or upload a new cover? You don't want to see stale metadata for 2 minutes or a stale cover for 30 days.
@@ -199,6 +201,7 @@ All settings are configured via environment variables (`vars` in `wrangler.jsonc
 | `MAX_CLASS_A_MONTH` | `"800000"` | Monthly Class A operation ceiling (`PUT`, `LIST`) when `FREE_TIER_GUARD="yes"` (80% of R2's 1,000,000 free tier). |
 | `MAX_CLASS_B_MONTH` | `"8000000"` | Monthly Class B operation ceiling (`GET`, `HEAD`) when `FREE_TIER_GUARD="yes"` (80% of R2's 10,000,000 free tier). |
 | `MAX_WARM_MB` | `"2000"` | Maximum total size (in MiB) of a single book eligible for background warming (prevents a single huge box-set from flushing the bucket). |
+| `WARM_WINDOW_TRACKS` | `"5"` | Number of chapters/tracks to warm in a sliding window from the active chapter forward on multi-file audiobooks (automatically advances as you listen). Set to `"0"` to warm all tracks immediately. |
 | `R2_DISABLED` | `"false"` | Manual emergency kill switch. Set to `"true"` to immediately bypass R2 and stream all audio from `ORIGIN`. |
 | `EDGE_CACHE` | `"on"` | Set to `"off"` to disable Cloudflare edge caching for covers and JSON metadata. |
 | `COVER_TTL_S` | `"2592000"` | Edge cache TTL in seconds for book covers and author images (default: 30 days). |
@@ -212,6 +215,11 @@ All settings are configured via environment variables (`vars` in `wrangler.jsonc
 ---
 
 ## 7. Step-by-Step Deployment Guide
+
+### Option A: One-Click Deploy to Cloudflare
+Click the **Deploy to Cloudflare** button at the top of this README to automatically fork/provision the Worker, KV namespace, R2 bucket (`abs-cache`), and Queue (`abs-warm`), and enter your `ORIGIN` URL in the browser. After deployment, attach your custom domain (Step 4 below).
+
+### Option B: Manual CLI Deployment
 
 ### Prerequisites
 * A Cloudflare account with your domain zone added and **HTTP/3 (with QUIC)** enabled under **Zone → Network → HTTP/3 (with QUIC)**.
@@ -308,7 +316,18 @@ Make an authenticated `GET` request to `/__abs-cache/status` (passing your Audio
 
 ---
 
-## 10. Changelog & License
+## 10. Client Compatibility
+
+| Client | Status | Notes |
+| :--- | :--- | :--- |
+| **Absorb** | **Tested & Working** | Tested with HTTP/3 (QUIC) streaming, R2 `206` byte-range caching, and Wi-Fi ↔ cellular handoffs. |
+| **Audiobookshelf Web UI** | Community testing welcome | Static Nuxt assets, SPA HTML shell, covers, and metadata are edge-cached. |
+| **Official Audiobookshelf App (iOS / Android)** | Pending testing | Uses `/api/items/:id/play` and `/public/session/:sid/track/:n`; feedback welcome. |
+| **Plappa / ShelfPlayer (iOS)** | Pending testing | Third-party iOS clients; feedback welcome. |
+
+---
+
+## 11. Changelog & License
 
 * See [CHANGELOG.md](./CHANGELOG.md) for the full architectural history and release notes.
 * Licensed under the [MIT License](./LICENSE).
