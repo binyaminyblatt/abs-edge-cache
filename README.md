@@ -4,6 +4,8 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/binyaminyblatt/abs-edge-cache)
 
+> **New to Cloudflare or networking?** Read the **[Quickstart Guide](./QUICKSTART.md)** for a plain-English explanation of what each piece does and how to get started in 4 steps.
+
 `abs-edge-cache` sits in front of your self-hosted Audiobookshelf server (for example, behind a Cloudflare Tunnel) and turns Cloudflare's global edge into a smart, zero-maintenance caching layer for **currently playing audiobooks**, **cover art**, and **library metadata**, while keeping your full multi-terabyte library on your home server and working transparently with official Audiobookshelf mobile apps and the Web UI.
 
 ---
