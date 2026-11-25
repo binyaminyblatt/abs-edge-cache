@@ -70,7 +70,7 @@ For any server on the public internet, we strongly recommend turning this on so 
 
 ### Step 4: Connect your custom web address and your app
 1. Still in **Workers & Pages → `abs-edge-cache` → Settings → Domains & Routes**, click **Add → Custom Domain** and enter the address you want to use (e.g., `audiobooks.yourdomain.com`).
-2. *(Optional)* In your Cloudflare Dashboard under your domain's **Network** settings, make sure **HTTP/3 (with QUIC)** is turned **On** — this is what keeps audio from dropping when you leave Wi-Fi.
+2. *(Optional, but highly recommended)* In your Cloudflare Dashboard under your domain's **Network** settings, make sure **HTTP/3 (with QUIC)** is turned **On** — this is what keeps audio from dropping when you leave Wi-Fi.
 3. Open your Audiobookshelf app (or browser) and log in using **`https://audiobooks.yourdomain.com`**.
 
 That's it! The first time you press Play on a book, it starts immediately from your home server while Cloudflare caches it in the background. After a few seconds, your stream and chapter skipping will come straight from Cloudflare.
