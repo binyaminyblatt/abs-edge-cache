@@ -4,6 +4,16 @@ All notable changes and architectural milestones of `abs-edge-cache` are documen
 
 ---
 
+## [1.1.0] - 2026-11-25
+
+### Added
+- **Opt-In On-Open Preemptive Caching (`PREWARM_IN_PROGRESS`):**
+  - When `PREWARM_IN_PROGRESS="yes"` (off by default), opening the app (`GET /api/me/items-in-progress` or `GET /api/libraries/:id/personalized`) pre-warms the active chapter and `WARM_WINDOW_TRACKS` upcoming chapters for the top `PREWARM_MAX_BOOKS` (default `2`, max `5`) in-progress books into R2.
+  - Uses the live request's credentials in memory for that single background task and **never** stores raw Bearer tokens or cookies in KV or Queues.
+  - Debounced per item (`prewarm:<itemId>`, 15 min TTL) and fully bounded by `FREE_TIER_GUARD` / `MAX_BUCKET_BYTES` / `MAX_WARM_MB`.
+
+---
+
 ## [1.0.1] - 2026-11-24
 
 ### Security

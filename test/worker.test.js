@@ -665,3 +665,68 @@ test("malformed URI on /s/item/:id/:file returns 400 Bad Request", async () => {
   const res = await worker.fetch(new Request("https://edge.example.com/s/item/b1/%E0%A4%A"), env, ctx);
   assert.equal(res.status, 400);
 });
+
+test("PREWARM_IN_PROGRESS=yes pre-warms active chapter on items-in-progress without storing tokens in KV", async () => {
+  const tracks = [
+    { index: 1, ino: "ino-1", mimeType: "audio/mpeg", startOffset: 0, duration: 100, metadata: { size: 5, filename: "ch1.mp3" } },
+    { index: 2, ino: "ino-2", mimeType: "audio/mpeg", startOffset: 100, duration: 100, metadata: { size: 5, filename: "ch2.mp3" } },
+    { index: 3, ino: "ino-3", mimeType: "audio/mpeg", startOffset: 200, duration: 100, metadata: { size: 5, filename: "ch3.mp3" } }
+  ];
+  installGlobals(async (req, opts) => {
+    const url = typeof req === "string" ? req : req.url;
+    const hdrs = typeof req === "string" ? new Headers(opts && opts.headers) : req.headers;
+    const auth = hdrs.get("authorization") || "";
+    assert.ok(auth === "Bearer secret-user-token" || auth === "Bearer secret-user-token-on");
+    if (url.endsWith("/api/me/items-in-progress")) {
+      return new Response(JSON.stringify({ libraryItems: [{ id: "book-pre-1" }, { id: "book-pre-2" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("/api/items/book-pre-1")) {
+      if (url.includes("/file/")) {
+        return new Response("AUDIO", { status: 200, headers: { "content-length": "5", "content-type": "audio/mpeg" } });
+      }
+      return new Response(JSON.stringify({
+        id: "book-pre-1",
+        userMediaProgress: { currentTime: 150 }, // inside track 2
+        media: { tracks }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("/api/items/book-pre-2")) {
+      return new Response(JSON.stringify({ id: "book-pre-2", media: { tracks: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    return new Response("ok", { status: 200 });
+  });
+
+  // Off by default: should NOT pre-warm
+  const envOff = makeEnv();
+  const ctxOff = makeCtx();
+  await worker.fetch(new Request("https://edge.example.com/api/me/items-in-progress", {
+    headers: { authorization: "Bearer secret-user-token" }
+  }), envOff, ctxOff);
+  await ctxOff.flush();
+  assert.equal(envOff.CACHE.store.size, 0);
+
+  // Enabled with PREWARM_IN_PROGRESS=yes & PREWARM_MAX_BOOKS=1 & WARM_WINDOW_TRACKS=2
+  const envOn = makeEnv({ PREWARM_IN_PROGRESS: "yes", PREWARM_MAX_BOOKS: "1", WARM_WINDOW_TRACKS: "2" });
+  const ctxOn = makeCtx();
+  const res = await worker.fetch(new Request("https://edge.example.com/api/me/items-in-progress", {
+    headers: { authorization: "Bearer secret-user-token-on" }
+  }), envOn, ctxOn);
+  assert.equal(res.status, 200);
+  await ctxOn.flush();
+
+  // Only tracks 2 and 3 of book-pre-1 should be warmed (track 1 skipped because currentTime=150 is in track 2)
+  assert.equal(envOn.CACHE.store.has("book-pre-1/track-1"), false);
+  assert.equal(envOn.CACHE.store.has("book-pre-1/track-2"), true);
+  assert.equal(envOn.CACHE.store.has("book-pre-1/track-3"), true);
+
+  // Ensure raw Bearer token is NEVER stored anywhere in KV
+  for (const [k, v] of envOn.KV.store.entries()) {
+    assert.ok(!String(k).includes("secret-user-token-on") && !String(v).includes("secret-user-token-on"));
+  }
+});

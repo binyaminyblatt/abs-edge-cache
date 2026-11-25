@@ -776,6 +776,148 @@ async function learnItemDetails(env, resp) {
   } catch (e) {}
 }
 
+async function prewarmInProgress(env, resp, request, url, cp) {
+  try {
+    if (!env.CACHE || !env.WARM || !env.KV) return;
+    var r2State = await getR2State(env, false);
+    if (r2State.tripped) return;
+    var cred = credential(request, url);
+    if (!cred) return;
+    if (isJwtVerifyEnabled(env)) {
+      var v = await verifyJwtToken(env, cred);
+      if (!v.valid) return;
+    }
+
+    var data = await resp.json();
+    var items = [];
+    if (cp === "/api/me/items-in-progress") {
+      items = Array.isArray(data && data.libraryItems) ? data.libraryItems : [];
+    } else if (Array.isArray(data)) {
+      for (var shelf of data) {
+        if (shelf && shelf.id === "continue-listening" && Array.isArray(shelf.entities)) {
+          items = shelf.entities;
+          break;
+        }
+      }
+    }
+    if (!items.length) return;
+
+    var maxBooks = Math.max(1, Math.min(num(env.PREWARM_MAX_BOOKS, 2), 5));
+    var selected = items.slice(0, maxBooks);
+    var origin = new URL(env.ORIGIN);
+    var authHeaders = {};
+    if (request.headers.get("authorization")) authHeaders["authorization"] = request.headers.get("authorization");
+    if (request.headers.get("cookie")) authHeaders["cookie"] = request.headers.get("cookie");
+
+    var lim = getLimits(env);
+    var maxBookBytes = num(env.MAX_WARM_MB, 2000) * 1048576;
+    if (lim.guardEnabled && lim.maxBytes > 0) maxBookBytes = Math.min(maxBookBytes, lim.maxBytes);
+    var winCount = Math.max(1, num(env.WARM_WINDOW_TRACKS, 5));
+    var snapshot = null;
+    var existingKeys = {};
+    var currentTotal = 0;
+
+    for (var item of selected) {
+      if (!item || !item.id) continue;
+      var debounceKey = "prewarm:" + item.id;
+      if (await env.KV.get(debounceKey)) continue;
+      await env.KV.put(debounceKey, "1", { expirationTtl: 900 });
+
+      var itemResp = await fetch(new URL("/api/items/" + item.id + "?include=progress", origin).toString(), {
+        method: "GET",
+        headers: authHeaders,
+      });
+      if (!itemResp.ok) continue;
+      var itemData = await itemResp.json();
+      var tracks = itemData && itemData.media && Array.isArray(itemData.media.tracks) ? itemData.media.tracks : [];
+      if (!tracks.length) continue;
+
+      await saveItemFileMap(env, item.id, tracks, itemData.libraryFiles);
+
+      var inoByFile = {};
+      if (Array.isArray(itemData.libraryFiles)) {
+        for (var lf of itemData.libraryFiles) {
+          if (lf && lf.ino && lf.metadata && lf.metadata.filename) {
+            inoByFile[lf.metadata.filename] = String(lf.ino);
+          }
+        }
+      }
+
+      var curTime = (itemData.userMediaProgress && typeof itemData.userMediaProgress.currentTime === "number")
+        ? itemData.userMediaProgress.currentTime
+        : ((item.userMediaProgress && typeof item.userMediaProgress.currentTime === "number") ? item.userMediaProgress.currentTime : 0);
+      var activeIdx = 0;
+      var jobs = [];
+      for (var i = 0; i < tracks.length; i++) {
+        var t = tracks[i];
+        var mm = /\/track\/(\d+)/.exec(t.contentUrl || "");
+        var n = mm ? mm[1] : String(t.index != null ? t.index : (i + 1));
+        var startOff = typeof t.startOffset === "number" ? t.startOffset : 0;
+        var dur = typeof t.duration === "number" ? t.duration : 0;
+        if (curTime > 0 && curTime >= startOff && (dur <= 0 || curTime < startOff + dur)) {
+          activeIdx = jobs.length;
+        }
+        var fname = (t.metadata && t.metadata.filename) || "";
+        var ino = t.ino ? String(t.ino) : (fname && inoByFile[fname] ? inoByFile[fname] : "");
+        var size = (t.metadata && t.metadata.size) || 0;
+        jobs.push({ n: n, key: item.id + "/track-" + n, ino: ino, size: size, mime: t.mimeType || "" });
+      }
+      var totalSize = jobs.reduce(function (a, j) { return a + j.size; }, 0);
+      if (totalSize > maxBookBytes) continue;
+
+      var toWarm = jobs.slice(activeIdx, activeIdx + winCount);
+      for (var j of toWarm) {
+        if (!j.ino) continue;
+        var stNow = await getR2State(env, false);
+        if (stNow.tripped) return;
+        var flag = "warm:" + j.key;
+        if (await env.KV.get(flag)) continue;
+        await recordR2Ops(env, 0, 1, undefined, false);
+        if (await env.CACHE.head(j.key)) {
+          await env.KV.put(flag, "1", { expirationTtl: 86400 });
+          continue;
+        }
+        var fileResp = await fetch(new URL("/api/items/" + item.id + "/file/" + j.ino, origin).toString(), {
+          method: "GET",
+          headers: authHeaders,
+        });
+        var len = parseInt(fileResp.headers.get("content-length") || "0", 10);
+        if (!fileResp.ok || !fileResp.body || !len || len > maxBookBytes) continue;
+
+        if (lim.guardEnabled) {
+          if (!snapshot) {
+            snapshot = await listAllObjects(env);
+            for (var o of snapshot) {
+              existingKeys[o.key] = true;
+              currentTotal += (o.size || 0);
+            }
+          }
+          if (existingKeys[j.key]) {
+            await env.KV.put(flag, "1", { expirationTtl: 86400 });
+            continue;
+          }
+          var cap = await ensureCapacityFromSnapshot(env, snapshot, len, item.id);
+          snapshot = cap.objs;
+          currentTotal = cap.total;
+          if (!cap.ok) continue;
+        }
+
+        var fls = new FixedLengthStream(len);
+        var pipe = fileResp.body.pipeTo(fls.writable);
+        await env.CACHE.put(j.key, fls.readable, {
+          httpMetadata: { contentType: j.mime || fileResp.headers.get("content-type") || "audio/mpeg" }
+        });
+        await pipe;
+        currentTotal += len;
+        existingKeys[j.key] = true;
+        if (lim.guardEnabled) snapshot.push({ key: j.key, size: len, uploaded: new Date().toISOString() });
+        await env.KV.put(flag, "1", { expirationTtl: 86400 });
+        await recordR2Ops(env, 1, 0, currentTotal, true);
+      }
+    }
+  } catch (e) {}
+}
+
 async function learnSessionData(env, s, request, url) {
   try {
     var sid = s && s.id, item = s && s.libraryItemId;
@@ -1267,6 +1409,11 @@ async function handleFetch(request, env, ctx, url, cp, isLoginPost, loginCheck) 
     }
     if (request.method === "GET" && env.KV && resp.status === 200 && /^\/api\/items\/[^/]+$/.test(cp)) {
       ctx.waitUntil(learnItemDetails(env, resp.clone()));
+    }
+    if (request.method === "GET" && env.CACHE && env.KV && resp.status === 200
+        && isTruthyFlag(env.PREWARM_IN_PROGRESS, false)
+        && (/^\/api\/me\/items-in-progress$/.test(cp) || /^\/api\/libraries\/[^/]+\/personalized$/.test(cp))) {
+      ctx.waitUntil(prewarmInProgress(env, resp.clone(), request, url, cp));
     }
     // Bump per-user progress epoch whenever listening progress or session state mutates
     if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS"
