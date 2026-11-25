@@ -235,7 +235,7 @@ Click the **Deploy to Cloudflare** button at the top of this README to automatic
 ### Option B: Manual CLI Deployment
 
 ### Prerequisites
-* A Cloudflare account with your domain zone added and **HTTP/3 (with QUIC)** enabled under **Zone → Network → HTTP/3 (with QUIC)**.
+* A Cloudflare account with your domain zone added and **HTTP/3 (with QUIC)** enabled under **Speed → Settings → Protocol Optimization** (usually On by default).
 * Your Audiobookshelf server reachable at an origin hostname (e.g., via a Cloudflare Tunnel at `https://abs-origin.example.com`).
 * R2 enabled on your Cloudflare account, and [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/) installed (`npm install`).
 
